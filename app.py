@@ -8,8 +8,16 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.1.0"
 DEX = "https://api.dexscreener.com"
+
+# Paper-perp universe. Short entries are only allowed for explicitly eligible
+# markets. These mints are used only as public price/signal proxies.
+PERP_UNIVERSE = {
+    "So11111111111111111111111111111111111111112": {"market": "SOL-PERP", "symbol": "SOL"},
+    "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh": {"market": "BTC-PERP", "symbol": "BTC"},
+    "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs": {"market": "ETH-PERP", "symbol": "ETH"},
+}
 ADMIN_KEY = os.getenv("NOVA_ADMIN_KEY", "change-me-now")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nova_trader.db")
 if DATABASE_URL.startswith("postgres://"):
@@ -69,8 +77,11 @@ DEFAULTS = {
     "max_positions": "4",
     "stop_loss_pct": "4",
     "daily_loss_limit_pct": "3",
-    "min_pump_score": "80",
-    "min_scalp_score": "82",
+    "min_pump_score": "72",
+    "min_scalp_score": "74",
+    "min_long_score": "72",
+    "min_short_score": "72",
+    "perp_leverage": "1.0",
     "min_liquidity": "20000",
     "min_market_risk": "70",
     "execution_cost_pct": "0.50",
@@ -133,7 +144,6 @@ def nz(v, d=0.0):
 
 def score_pair(p, source_boost=0):
     tx5 = (p.get("txns") or {}).get("m5") or {}
-    tx1 = (p.get("txns") or {}).get("h1") or {}
     buys5, sells5 = nz(tx5.get("buys")), nz(tx5.get("sells"))
     total5 = buys5 + sells5
     pressure = 50 if total5 == 0 else 100 * buys5 / total5
@@ -145,7 +155,8 @@ def score_pair(p, source_boost=0):
 
     pc = p.get("priceChange") or {}
     m5, h1 = nz(pc.get("m5")), nz(pc.get("h1"))
-    momentum = max(0, min(100, 50 + m5 * 5.0 + h1 * 0.6))
+    bull_momentum = max(0, min(100, 50 + m5 * 5.0 + h1 * 0.65))
+    bear_momentum = max(0, min(100, 50 - m5 * 5.0 - h1 * 0.65))
 
     liq = nz((p.get("liquidity") or {}).get("usd"))
     liquidity_score = max(0, min(100, 20 + 22 * math.log10(max(liq, 1) / 1000)))
@@ -160,7 +171,7 @@ def score_pair(p, source_boost=0):
 
     boost = min(100, source_boost)
     pump = round(
-        vol_accel * .22 + pressure * .22 + momentum * .20 +
+        vol_accel * .22 + pressure * .22 + bull_momentum * .20 +
         liquidity_score * .14 + ratio_score * .12 + age_score * .07 + boost * .03
     )
     scalp = round(
@@ -168,7 +179,17 @@ def score_pair(p, source_boost=0):
         vol_accel*.18 + liquidity_score*.20 + ratio_score*.13
     )
 
-    # "Market Risk" is deliberately NOT called a security audit.
+    # Directional scores are used by the perp paper engine.
+    long_score = round(
+        pressure * .25 + bull_momentum * .30 + vol_accel * .18 +
+        liquidity_score * .17 + age_score * .10
+    )
+    short_score = round(
+        (100-pressure) * .25 + bear_momentum * .30 + vol_accel * .18 +
+        liquidity_score * .17 + age_score * .10
+    )
+
+    # "Market Risk" is a market-quality gate, not a token security audit.
     market_risk = round(
         liquidity_score*.35 + ratio_score*.25 + age_score*.20 +
         max(0,min(100, 70 - abs(m5)*1.4))*.20
@@ -176,6 +197,8 @@ def score_pair(p, source_boost=0):
     return {
         "pump_score": max(0,min(100,pump)),
         "scalp_score": max(0,min(100,scalp)),
+        "long_score": max(0,min(100,long_score)),
+        "short_score": max(0,min(100,short_score)),
         "market_risk": max(0,min(100,market_risk)),
         "buy_pressure": round(pressure,1),
         "volume_accel": round(vol_accel,1),
@@ -237,12 +260,65 @@ async def fetch_pairs(client, addresses, boosts):
                     "price":price,
                     "dex":p.get("dexId",""),
                     "url":p.get("url",""),
+                    "perp_eligible": False,
+                    "perp_market": None,
                     **sc
                 })
         except Exception as e:
             runtime["last_error"]=f"pairs: {e}"
     pairs.sort(key=lambda x:max(x["pump_score"],x["scalp_score"]),reverse=True)
     return pairs[:60]
+
+async def fetch_perp_pairs(client):
+    """Fetch public Solana DEX proxies for markets eligible for paper long/short."""
+    out=[]
+    for mint,spec in PERP_UNIVERSE.items():
+        try:
+            r=await client.get(DEX+"/tokens/v1/solana/"+mint, timeout=20)
+            r.raise_for_status()
+            raw=r.json() or []
+            matches=[
+                p for p in raw
+                if (p.get("baseToken") or {}).get("address")==mint and nz(p.get("priceUsd"))>0
+            ]
+            if not matches:
+                continue
+            p=max(matches, key=lambda x:nz((x.get("liquidity") or {}).get("usd")))
+            sc=score_pair(p,0)
+            out.append({
+                "mint":mint,
+                "symbol":spec["symbol"],
+                "name":spec["market"],
+                "price":nz(p.get("priceUsd")),
+                "dex":p.get("dexId",""),
+                "url":p.get("url",""),
+                "perp_eligible":True,
+                "perp_market":spec["market"],
+                **sc
+            })
+        except Exception as e:
+            runtime["last_error"]=f"perp {spec['market']}: {e}"
+    return out
+
+def strategy_side(strategy):
+    return "SHORT" if str(strategy).endswith("_SHORT") else "LONG"
+
+def strategy_leverage(strategy):
+    if not str(strategy).startswith("PERP_"):
+        return 1.0
+    return max(1.0,min(2.0,f("perp_leverage")))
+
+def directional_raw_return(entry, price, side):
+    raw=(price/max(entry,1e-12))-1.0
+    return -raw if side=="SHORT" else raw
+
+def directional_return_pct(p, price):
+    return directional_raw_return(p.entry_price, price, strategy_side(p.strategy))*strategy_leverage(p.strategy)*100
+
+def paper_position_value(p, price):
+    raw=directional_raw_return(p.entry_price, price, strategy_side(p.strategy))
+    value=p.remaining_cost*(1 + raw*strategy_leverage(p.strategy))
+    return max(0.0,value)
 
 def positions_with_marks():
     cands={x["mint"]:x for x in runtime["candidates"]}
@@ -251,11 +327,13 @@ def positions_with_marks():
         for p in s.scalars(select(Position)).all():
             c=cands.get(p.mint)
             price=c["price"] if c else p.last_price
-            ret=(price/p.entry_price-1)*100
-            value=p.remaining_cost*(price/p.entry_price)
+            ret=directional_return_pct(p,price)
+            value=paper_position_value(p,price)
             out.append({
                 "id":p.id,"mint":p.mint,"symbol":p.symbol,"name":p.name,
-                "strategy":p.strategy,"entry":p.entry_price,"price":price,
+                "strategy":p.strategy,"side":strategy_side(p.strategy),
+                "leverage":strategy_leverage(p.strategy),
+                "entry":p.entry_price,"price":price,
                 "return_pct":ret,"remaining_cost":p.remaining_cost,
                 "market_value":value,"locked_pnl":p.locked_pnl,
                 "opened_at":p.opened_at.isoformat()
@@ -276,11 +354,22 @@ def metrics():
     winrate=(len(wins)/len(trades)*100) if trades else 0
     start=f("start_balance")
     pnl=equity-start
+    long_trades=[t for t in trades if strategy_side(t.strategy)=="LONG"]
+    short_trades=[t for t in trades if strategy_side(t.strategy)=="SHORT"]
+    def side_stats(items):
+        sw=[t for t in items if t.pnl>=0]
+        return {
+            "trades":len(items),
+            "wins":len(sw),
+            "win_rate":(len(sw)/len(items)*100) if items else 0,
+            "pnl":sum(t.pnl for t in items)
+        }
     return {
         "cash":cash,"equity":equity,"pnl":pnl,"pnl_pct":pnl/start*100 if start else 0,
         "trades":len(trades),"wins":len(wins),"losses":len(losses),
         "win_rate":winrate,"profit_factor":profit_factor,
-        "open_positions":len(positions)
+        "open_positions":len(positions),
+        "long":side_stats(long_trades),"short":side_stats(short_trades)
     }
 
 def today_realized():
@@ -298,12 +387,14 @@ def consecutive_losses():
         else:break
     return n
 
-def gate(c):
+def gate(c,strategy=None):
     if b("killed"): return False,"kill switch"
     if not b("bot_enabled"): return False,"bot stopped"
     if runtime["pause_until"] and datetime.now(timezone.utc)<runtime["pause_until"]: return False,"loss pause"
     if c["liquidity"] < f("min_liquidity"): return False,"low liquidity"
     if c["market_risk"] < f("min_market_risk"): return False,"market risk gate"
+    if strategy and strategy_side(strategy)=="SHORT" and not c.get("perp_eligible"):
+        return False,"short unavailable for spot-only token"
     with SessionLocal() as s:
         if s.scalar(select(Position).where(Position.mint==c["mint"])): return False,"already open"
         if len(s.scalars(select(Position)).all()) >= i("max_positions"): return False,"max positions"
@@ -314,43 +405,50 @@ def gate(c):
     return True,"ok"
 
 def open_position(c,strategy):
-    ok,reason=gate(c)
+    ok,reason=gate(c,strategy)
     if not ok:return False,reason
     m=metrics()
+    leverage=max(1.0,min(2.0,strategy_leverage(strategy)))
     risk_budget=m["equity"]*f("risk_pct")/100
-    notional=risk_budget/max(f("stop_loss_pct")/100,0.001)
-    notional=min(notional,m["equity"]*f("max_position_pct")/100,f("cash"))
-    if notional<5:return False,"position too small"
-    cost=notional*(1+f("execution_cost_pct")/100)
-    if cost>f("cash"): return False,"cash"
-    setv("cash",f("cash")-cost)
+    collateral=risk_budget/max((f("stop_loss_pct")/100)*leverage,0.001)
+    collateral=min(collateral,m["equity"]*f("max_position_pct")/100,f("cash"))
+    if collateral<5:return False,"position too small"
+    open_fee=collateral*leverage*f("execution_cost_pct")/100
+    cash_need=collateral+open_fee
+    if cash_need>f("cash"): return False,"cash"
+    setv("cash",f("cash")-cash_need)
     now=datetime.now(timezone.utc)
     with SessionLocal() as s:
         s.add(Position(
             mint=c["mint"],symbol=c["symbol"],name=c["name"],strategy=strategy,
             entry_price=c["price"],last_price=c["price"],peak_price=c["price"],
-            initial_notional=notional,remaining_cost=notional,locked_pnl=-notional*f("execution_cost_pct")/100,
+            initial_notional=collateral,remaining_cost=collateral,locked_pnl=-open_fee,
             opened_at=now
         ));s.commit()
     return True,"opened"
 
 def partial_sell(p, c, fraction):
     fraction=min(fraction,p.remaining_cost/max(p.initial_notional,1e-9))
-    cost_basis=p.initial_notional*fraction
-    cost_basis=min(cost_basis,p.remaining_cost)
+    cost_basis=min(p.initial_notional*fraction,p.remaining_cost)
     if cost_basis<=0:return
-    gross=cost_basis*(c["price"]/p.entry_price)
-    fee=gross*f("execution_cost_pct")/100
-    net=gross-fee
+    side=strategy_side(p.strategy)
+    leverage=strategy_leverage(p.strategy)
+    raw=directional_raw_return(p.entry_price,c["price"],side)
+    gross_return=max(0.0,cost_basis*(1+raw*leverage))
+    fee=cost_basis*leverage*f("execution_cost_pct")/100
+    net=max(0.0,gross_return-fee)
     pnl=net-cost_basis
     setv("cash",f("cash")+net)
     p.remaining_cost-=cost_basis
     p.locked_pnl+=pnl
 
 def close_position(p,c,reason):
-    gross=p.remaining_cost*(c["price"]/p.entry_price)
-    fee=gross*f("execution_cost_pct")/100
-    net=gross-fee
+    side=strategy_side(p.strategy)
+    leverage=strategy_leverage(p.strategy)
+    raw=directional_raw_return(p.entry_price,c["price"],side)
+    gross_return=max(0.0,p.remaining_cost*(1+raw*leverage))
+    fee=p.remaining_cost*leverage*f("execution_cost_pct")/100
+    net=max(0.0,gross_return-fee)
     rem_pnl=net-p.remaining_cost
     total=p.locked_pnl+rem_pnl
     setv("cash",f("cash")+net)
@@ -370,25 +468,34 @@ def manage_positions():
     cands={x["mint"]:x for x in runtime["candidates"]}
     with SessionLocal() as s:
         pos=s.scalars(select(Position)).all()
-        # detach enough state before actions
-        for p in pos:
-            s.expunge(p)
+        for p in pos:s.expunge(p)
     for p in pos:
         c=cands.get(p.mint)
         if not c:continue
         with SessionLocal() as s:
             obj=s.get(Position,p.id)
             if not obj:continue
-            obj.last_price=c["price"];obj.peak_price=max(obj.peak_price,c["price"])
-            ret=(c["price"]/obj.entry_price-1)*100
-            peak=(obj.peak_price/obj.entry_price-1)*100
-            pull=(c["price"]/obj.peak_price-1)*100
+            side=strategy_side(obj.strategy)
+            obj.last_price=c["price"]
+            if side=="SHORT":
+                obj.peak_price=min(obj.peak_price,c["price"])
+            else:
+                obj.peak_price=max(obj.peak_price,c["price"])
+
+            ret=directional_return_pct(obj,c["price"])
+            peak=directional_return_pct(obj,obj.peak_price)
+            pull=ret-peak
             prevliq=runtime["prev_liq"].get(obj.mint,c["liquidity"])
-            # exits
             reason=None
-            if ret<=-f("stop_loss_pct"): reason="STOP_LOSS"
-            elif prevliq>0 and c["liquidity"]<prevliq*.65: reason="LIQUIDITY_DROP"
-            elif c["buy_pressure"]<24 and ret>0: reason="MOMENTUM_EXIT"
+
+            if ret<=-f("stop_loss_pct"):
+                reason="STOP_LOSS"
+            elif not str(obj.strategy).startswith("PERP_") and prevliq>0 and c["liquidity"]<prevliq*.65:
+                reason="LIQUIDITY_DROP"
+            elif side=="LONG" and c["buy_pressure"]<24 and ret>0:
+                reason="MOMENTUM_EXIT"
+            elif side=="SHORT" and c["buy_pressure"]>76 and ret>0:
+                reason="SHORT_SQUEEZE_EXIT"
             else:
                 if ret>=8 and not obj.tp1: partial_sell(obj,c,.15);obj.tp1=True
                 if ret>=15 and not obj.tp2: partial_sell(obj,c,.20);obj.tp2=True
@@ -398,32 +505,50 @@ def manage_positions():
                 elif peak>=35:trail=-11
                 elif peak>=20:trail=-8
                 elif peak>=8:trail=-5
-                if trail is not None and pull<=trail: reason="TRAILING_EXIT"
+                if trail is not None and pull<=trail:reason="TRAILING_EXIT"
             s.commit()
             s.expunge(obj)
-        if reason: close_position(obj,c,reason)
+        if reason:close_position(obj,c,reason)
 
 def choose_entry():
     if not b("bot_enabled") or b("killed"):return
     if runtime["pause_until"] and datetime.now(timezone.utc)<runtime["pause_until"]:return
+
+    opportunities=[]
     for c in runtime["candidates"]:
-        ok,_=gate(c)
-        if not ok:continue
-        if c["pump_score"]>=f("min_pump_score"):
-            open_position(c,"PUMP");return
-        if c["scalp_score"]>=f("min_scalp_score"):
-            open_position(c,"SCALP");return
+        if c.get("perp_eligible"):
+            if c["long_score"]>=f("min_long_score"):
+                opportunities.append((c["long_score"],c,"PERP_LONG"))
+            if c["short_score"]>=f("min_short_score"):
+                opportunities.append((c["short_score"],c,"PERP_SHORT"))
+        else:
+            if c["pump_score"]>=f("min_pump_score"):
+                opportunities.append((c["pump_score"],c,"PUMP_LONG"))
+            if c["scalp_score"]>=f("min_scalp_score"):
+                opportunities.append((c["scalp_score"],c,"SCALP_LONG"))
+
+    opportunities.sort(key=lambda x:x[0],reverse=True)
+    for score,c,strategy in opportunities:
+        ok,_=gate(c,strategy)
+        if ok:
+            open_position(c,strategy)
+            return
 
 async def engine_loop():
     runtime["loop_alive"]=True
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Paper/4.0"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Paper/4.1"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
                 now=time.time()
                 if now-last_discovery>60 or not addresses:
                     addresses,boosts=await discover(client);last_discovery=now
-                pairs=await fetch_pairs(client,addresses,boosts)
+                spot_pairs=await fetch_pairs(client,addresses,boosts)
+                perp_pairs=await fetch_perp_pairs(client)
+                merged={c["mint"]:c for c in spot_pairs}
+                for c in perp_pairs:merged[c["mint"]]=c
+                pairs=list(merged.values())
+                pairs.sort(key=lambda x:max(x["pump_score"],x["scalp_score"],x["long_score"],x["short_score"]),reverse=True)
                 if pairs:
                     runtime["candidates"]=pairs
                     runtime["last_refresh"]=datetime.now(timezone.utc).isoformat()
@@ -447,6 +572,9 @@ class SettingsIn(BaseModel):
     daily_loss_limit_pct: Optional[float]=None
     min_pump_score: Optional[float]=None
     min_scalp_score: Optional[float]=None
+    min_long_score: Optional[float]=None
+    min_short_score: Optional[float]=None
+    perp_leverage: Optional[float]=None
     min_liquidity: Optional[float]=None
     min_market_risk: Optional[float]=None
     execution_cost_pct: Optional[float]=None
@@ -457,7 +585,7 @@ class WatchIn(BaseModel):
 
 @app.get("/")
 def root():
-    return {"name":"NOVA Trader Cloud","version":APP_VERSION,"mode":"PAPER ONLY","docs":"/docs"}
+    return {"name":"NOVA Trader Cloud","version":APP_VERSION,"mode":"LONG + SHORT PAPER ONLY","docs":"/docs"}
 
 @app.get("/health")
 def health():
@@ -477,12 +605,12 @@ def dashboard():
         "positions":positions_with_marks(),
         "candidates":runtime["candidates"][:30],
         "trades":[{
-            "id":t.id,"symbol":t.symbol,"strategy":t.strategy,"pnl":t.pnl,
+            "id":t.id,"symbol":t.symbol,"strategy":t.strategy,"side":strategy_side(t.strategy),"pnl":t.pnl,
             "pnl_pct":t.pnl_pct,"reason":t.reason,"closed_at":t.closed_at.isoformat()
         } for t in trades],
         "settings":{k:float(getv(k)) for k in [
             "risk_pct","max_position_pct","max_positions","stop_loss_pct","daily_loss_limit_pct",
-            "min_pump_score","min_scalp_score","min_liquidity","min_market_risk","execution_cost_pct","cooldown_minutes"
+            "min_pump_score","min_scalp_score","min_long_score","min_short_score","perp_leverage","min_liquidity","min_market_risk","execution_cost_pct","cooldown_minutes"
         ]}
     }
 
