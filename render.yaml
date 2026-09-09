@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: nova-trader-cloud
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nova-trader-db
+          property: connectionString
+      - key: NOVA_ADMIN_KEY
+        sync: false
+      - key: PAPER_START_BALANCE
+        value: "5000"
+
+databases:
+  - name: nova-trader-db
+    plan: free
+    databaseName: novatrader
+    user: nova
