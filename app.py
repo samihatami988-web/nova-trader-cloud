@@ -2,17 +2,23 @@ import os, asyncio, math, time, random, json
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import httpx
+import websockets
+
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "6.0.0"
+APP_VERSION = "6.1.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 LIVE_EXECUTION_LOCKED = True
+
+PUMPPORTAL_API_KEY = os.getenv("PUMPPORTAL_API_KEY","").strip()
+PUMPPORTAL_TRADE_STREAM_ENABLED = os.getenv("PUMPPORTAL_TRADE_STREAM_ENABLED","false").lower() in ("1","true","yes","on")
+PUMPPORTAL_WS_BASE = "wss://pumpportal.fun/api/data"
 
 # Legacy public-price fallback only. Primary perp intelligence in V4.2 comes from Velocity Data API.
 PERP_UNIVERSE = {
@@ -266,6 +272,15 @@ DEFAULTS = {
     "sniper_scratch_loss_pct": "0.35",
     "sniper_max_hold_minutes": "5",
 
+    "realtime_pulse_enabled": "true",
+    "pulse_min_score": "76",
+    "pulse_min_events_5s": "4",
+    "pulse_min_buy_pressure_5s": "68",
+    "pulse_min_unique_buyers_10s": "3",
+    "pulse_max_m5_pct": "10",
+    "pulse_cooldown_sec": "45",
+    "pulse_eval_timeout_sec": "5",
+
     "daily_profit_target_pct": "10.0",
     "daily_profit_secure_buffer_pct": "0.25",
     "daily_de_risk_start_pct": "7.0",
@@ -358,6 +373,17 @@ runtime = {
     "sniper_candidates": [],
     "daily_target_locked": False,
     "daily_target_lock_time": None,
+
+    "pulse_stream_connected": False,
+    "pulse_stream_mode": "OFF",
+    "pulse_stream_error": None,
+    "pulse_last_event": 0,
+    "pulse_events_total": 0,
+    "pulse_buffers": {},
+    "pulse_hot": {},
+    "pulse_evaluating": set(),
+    "pulse_subscribed": set(),
+    "pulse_entries": 0,
     "engine_error_streak": 0,
     "last_decision_log": {},
     "last_event_log": {},
@@ -2499,12 +2525,220 @@ def manage_positions():
                 runtime["daily_target_lock_time"]=datetime.now(timezone.utc).isoformat()
 
 
+
+def pulse_metrics(mint):
+    now=time.time()
+    buf=runtime["pulse_buffers"].get(mint,[])
+    buf=[e for e in buf if now-e["t"]<=30]
+    runtime["pulse_buffers"][mint]=buf
+
+    def window(sec):
+        return [e for e in buf if now-e["t"]<=sec]
+
+    e2,e5,e10,e30=window(2),window(5),window(10),window(30)
+    buys5=[e for e in e5 if e["buy"]]
+    buys10=[e for e in e10 if e["buy"]]
+    old=[e for e in e30 if now-e["t"]>5]
+
+    pressure=100*len(buys5)/max(len(e5),1)
+    rate5=len(e5)/5.0
+    old_rate=len(old)/25.0
+    accel=clamp((rate5/max(old_rate,0.08))*18,0,100)
+    frequency=clamp(len(e2)*18+len(e5)*4,0,100)
+    unique_buyers=len({e.get("trader") for e in buys10 if e.get("trader")})
+    unique_score=clamp(unique_buyers*15,0,100)
+    buy_sol5=sum(e.get("sol",0) for e in buys5)
+    flow_score=clamp(20*math.log10(max(buy_sol5,0.01)*10+1),0,100)
+
+    score=clamp(
+        pressure*.27 + accel*.24 + frequency*.20 +
+        unique_score*.17 + flow_score*.12,0,100
+    )
+    return {
+        "mint":mint,"score":round(score,1),
+        "events_2s":len(e2),"events_5s":len(e5),"events_10s":len(e10),
+        "buy_pressure_5s":round(pressure,1),
+        "unique_buyers_10s":unique_buyers,
+        "buy_sol_5s":round(buy_sol5,4),
+        "acceleration_score":round(accel,1),
+        "frequency_score":round(frequency,1),
+        "age_sec":round(now-buf[-1]["t"],2) if buf else None
+    }
+
+def add_pulse_event(data):
+    mint=str(data.get("mint") or data.get("tokenAddress") or "").strip()
+    if len(mint)<30:return None
+    now=time.time()
+    tx=str(data.get("txType") or data.get("type") or "").lower()
+    buy=tx in ("buy","create") or str(data.get("isBuy","")).lower()=="true"
+    sol_amt=abs(nz(data.get("solAmount") or data.get("sol_amount") or data.get("amountSol")))
+    trader=str(data.get("traderPublicKey") or data.get("trader") or data.get("user") or "")
+
+    buf=runtime["pulse_buffers"].setdefault(mint,[])
+    buf.append({"t":now,"buy":buy,"sol":sol_amt,"trader":trader})
+    runtime["pulse_buffers"][mint]=[e for e in buf if now-e["t"]<=30]
+    runtime["pulse_last_event"]=now
+    runtime["pulse_events_total"]+=1
+    m=pulse_metrics(mint)
+    if m["score"]>=f("pulse_min_score")-10:
+        runtime["pulse_hot"][mint]={**m,"seen_at":now}
+    return m
+
+def pulse_gate_metrics(m):
+    if not b("realtime_pulse_enabled"):return False,"pulse disabled"
+    if nz(m.get("score"))<f("pulse_min_score"):return False,"pulse score"
+    if i("pulse_min_events_5s")>int(m.get("events_5s") or 0):return False,"pulse event count"
+    if nz(m.get("buy_pressure_5s"))<f("pulse_min_buy_pressure_5s"):return False,"pulse buy pressure"
+    if int(m.get("unique_buyers_10s") or 0)<i("pulse_min_unique_buyers_10s"):return False,"pulse unique buyers"
+    return True,"ok"
+
+async def evaluate_pulse_mint(mint,m):
+    if mint in runtime["pulse_evaluating"]:return
+    runtime["pulse_evaluating"].add(mint)
+    try:
+        ok,reason=pulse_gate_metrics(m)
+        if not ok:return
+
+        # Prevent repeated evaluation/open attempts on the same burst.
+        hot=runtime["pulse_hot"].get(mint,{})
+        last_eval=nz(hot.get("last_eval"))
+        if last_eval and time.time()-last_eval<f("pulse_cooldown_sec"):
+            return
+        hot["last_eval"]=time.time()
+        runtime["pulse_hot"][mint]=hot
+
+        timeout=max(2,min(10,f("pulse_eval_timeout_sec")))
+        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.1"}) as client:
+            rows=await asyncio.wait_for(fetch_pairs(client,[mint],{}),timeout=timeout)
+            if not rows:return
+            c=rows[0]
+
+            # The real-time pulse supplements — never bypasses — price/liquidity/security gates.
+            c["pulse"]=m
+            c["pulse_score"]=m["score"]
+            c["sniper_score"]=max(nz(c.get("sniper_score")),nz(m.get("score")))
+            c["best_strategy"]="SNIPER_LONG"
+
+            if nz(c.get("m5"))>f("pulse_max_m5_pct"):
+                log_decision(c,"SNIPER_LONG","BLOCKED","pulse late chase",
+                             c["sniper_score"],0,0,nz((c.get("security") or {}).get("score"),50))
+                return
+
+            # Scan security if not already cached. PAPER tolerates UNKNOWN, SHADOW remains strict.
+            cached=runtime["token_security"].get(mint)
+            if cached:
+                c["security"]={k:v for k,v in cached.items() if k!="_ts"}
+            else:
+                c["security"]=await scan_token_security(client,c)
+
+            merge_position_updates([c])
+
+            async with entry_lock:
+                gate_ok,gate_reason=sniper_gate(c)
+                quality,route=signal_quality(c,"SNIPER_LONG",c["sniper_score"])
+                sec_score=nz((c.get("security") or {}).get("score"),50)
+                if not gate_ok:
+                    log_decision(c,"SNIPER_LONG","BLOCKED",gate_reason,
+                                 c["sniper_score"],quality,route.get("quality",0),sec_score)
+                    return
+                opened,oreason=open_position(c,"SNIPER_LONG")
+                if opened:
+                    runtime["pulse_entries"]+=1
+                    runtime["sniper_entries"]+=1
+                    log_decision(c,"SNIPER_LONG","OPENED","REALTIME_PULSE_ENTRY",
+                                 c["sniper_score"],quality,route.get("quality",0),sec_score)
+                    record_event("INFO","REALTIME_PULSE_ENTRY",
+                                 f"{c.get('symbol')} real-time pulse sniper opened",
+                                 {"pulse":m,"m5":c.get("m5"),"liquidity":c.get("liquidity")})
+                else:
+                    log_decision(c,"SNIPER_LONG","BLOCKED",oreason,
+                                 c["sniper_score"],quality,route.get("quality",0),sec_score)
+    except asyncio.TimeoutError:
+        runtime["pulse_stream_error"]="pulse candidate evaluation timeout"
+    except Exception as e:
+        runtime["pulse_stream_error"]=f"pulse eval: {str(e)[:180]}"
+    finally:
+        runtime["pulse_evaluating"].discard(mint)
+
+async def pumpportal_realtime_loop():
+    # Real-time trade subscriptions are opt-in because the provider meters trade events.
+    if not PUMPPORTAL_API_KEY:
+        runtime["pulse_stream_mode"]="FALLBACK_ONLY"
+        runtime["pulse_stream_error"]="PUMPPORTAL_API_KEY not configured"
+        return
+    if not PUMPPORTAL_TRADE_STREAM_ENABLED:
+        runtime["pulse_stream_mode"]="KEY_READY_TRADE_STREAM_OFF"
+        runtime["pulse_stream_error"]="Trade stream disabled by environment setting"
+        return
+
+    uri=f"{PUMPPORTAL_WS_BASE}?api-key={PUMPPORTAL_API_KEY}"
+    backoff=2
+    while True:
+        try:
+            async with websockets.connect(uri,ping_interval=20,ping_timeout=20,close_timeout=5,max_size=2_000_000) as ws:
+                runtime["pulse_stream_connected"]=True
+                runtime["pulse_stream_mode"]="PUMPPORTAL_REALTIME"
+                runtime["pulse_stream_error"]=None
+                backoff=2
+
+                # One websocket connection only. New-token events seed the rolling trade universe.
+                await ws.send(json.dumps({"method":"subscribeNewToken"}))
+                await ws.send(json.dumps({"method":"subscribeMigration"}))
+
+                # Seed subscriptions from the strongest current spot candidates.
+                seeds=[
+                    c.get("mint") for c in runtime.get("candidates",[])
+                    if not c.get("perp_eligible") and c.get("mint")
+                ][:40]
+                if seeds:
+                    await ws.send(json.dumps({"method":"subscribeTokenTrade","keys":seeds}))
+                    runtime["pulse_subscribed"].update(seeds)
+
+                async for raw in ws:
+                    try:data=json.loads(raw)
+                    except:continue
+                    if not isinstance(data,dict):continue
+                    mint=str(data.get("mint") or data.get("tokenAddress") or "").strip()
+                    if len(mint)<30:continue
+
+                    tx=str(data.get("txType") or data.get("type") or "").lower()
+
+                    # A creation/migration event becomes a live trade subscription.
+                    if tx in ("create","migration","migrate") or data.get("name"):
+                        if mint not in runtime["pulse_subscribed"]:
+                            await ws.send(json.dumps({"method":"subscribeTokenTrade","keys":[mint]}))
+                            runtime["pulse_subscribed"].add(mint)
+
+                    m=add_pulse_event(data)
+                    if m:
+                        ok,_=pulse_gate_metrics(m)
+                        if ok:
+                            asyncio.create_task(evaluate_pulse_mint(mint,m))
+
+                    # Bound local subscription memory. Connection is recycled to prune server subs.
+                    if len(runtime["pulse_subscribed"])>350:
+                        raise RuntimeError("subscription recycle")
+
+        except Exception as e:
+            runtime["pulse_stream_connected"]=False
+            runtime["pulse_stream_error"]=str(e)[:220]
+            record_event("WARN","PULSE_STREAM_RECONNECT","Real-time pulse stream reconnecting",
+                         {"error":runtime["pulse_stream_error"]},dedupe_sec=60)
+            await asyncio.sleep(backoff)
+            backoff=min(backoff*2,30)
+        finally:
+            runtime["pulse_stream_connected"]=False
+            if len(runtime["pulse_subscribed"])>350:
+                runtime["pulse_subscribed"].clear()
+
 def sniper_gate(c):
     if not b("sniper_enabled"):
         return False,"sniper disabled"
     if c.get("perp_eligible"):
         return False,"sniper spot only"
-    if nz(c.get("sniper_score")) < effective_threshold("SNIPER_LONG",c):
+    required=effective_threshold("SNIPER_LONG",c)
+    effective_score=max(nz(c.get("sniper_score")),nz(c.get("pulse_score")))
+    if effective_score < required:
         return False,"sniper score"
     if nz(c.get("buy_pressure")) < f("sniper_min_buy_pressure"):
         return False,"sniper buy pressure"
@@ -2648,7 +2882,7 @@ async def sniper_scan_loop():
     runtime["sniper_scanner_alive"]=True
     record_event("INFO","SNIPER_START","Micro-Pump Sniper scanner started",
                  {"interval_sec":i("sniper_scan_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.0"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.1"}) as client:
         while True:
             try:
                 if b("sniper_enabled"):
@@ -2710,7 +2944,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.0"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.1"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -2759,7 +2993,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.0"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.1"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -2855,6 +3089,7 @@ async def startup():
     asyncio.create_task(engine_loop())
     asyncio.create_task(position_watch_loop())
     asyncio.create_task(sniper_scan_loop())
+    asyncio.create_task(pumpportal_realtime_loop())
 
 class SettingsIn(BaseModel):
     risk_pct: Optional[float]=None
@@ -2940,6 +3175,15 @@ class SettingsIn(BaseModel):
     sniper_scratch_loss_pct: Optional[float]=None
     sniper_max_hold_minutes: Optional[float]=None
 
+    realtime_pulse_enabled: Optional[bool]=None
+    pulse_min_score: Optional[float]=None
+    pulse_min_events_5s: Optional[int]=None
+    pulse_min_buy_pressure_5s: Optional[float]=None
+    pulse_min_unique_buyers_10s: Optional[int]=None
+    pulse_max_m5_pct: Optional[float]=None
+    pulse_cooldown_sec: Optional[float]=None
+    pulse_eval_timeout_sec: Optional[float]=None
+
     daily_profit_target_pct: Optional[float]=None
     daily_profit_secure_buffer_pct: Optional[float]=None
     daily_de_risk_start_pct: Optional[float]=None
@@ -2999,6 +3243,22 @@ def dashboard():
             "max_total_open_risk_pct":f("max_total_open_risk_pct"),
             "target_risk_multiplier":daily_target_risk_multiplier(),
             "no_martingale":b("no_martingale")
+        },
+        "realtime_pulse":{
+            "enabled":b("realtime_pulse_enabled"),
+            "connected":runtime["pulse_stream_connected"],
+            "mode":runtime["pulse_stream_mode"],
+            "events_total":runtime["pulse_events_total"],
+            "entries":runtime["pulse_entries"],
+            "subscribed_tokens":len(runtime["pulse_subscribed"]),
+            "last_event_age_sec":round(time.time()-runtime["pulse_last_event"],3) if runtime["pulse_last_event"] else None,
+            "hot":[{
+                "mint":mint,"score":v.get("score"),"events_2s":v.get("events_2s"),
+                "events_5s":v.get("events_5s"),"buy_pressure_5s":v.get("buy_pressure_5s"),
+                "unique_buyers_10s":v.get("unique_buyers_10s"),"buy_sol_5s":v.get("buy_sol_5s"),
+                "acceleration_score":v.get("acceleration_score")
+            } for mint,v in sorted(runtime["pulse_hot"].items(),
+                key=lambda kv:nz(kv[1].get("score")),reverse=True)[:8]]
         },
         "sniper":{
             "enabled":b("sniper_enabled"),
@@ -3063,7 +3323,10 @@ def dashboard():
                 "sniper_min_volume_accel","sniper_min_m5_pct","sniper_max_m5_pct",
                 "sniper_max_age_minutes","sniper_max_positions","sniper_risk_multiplier",
                 "sniper_max_loss_pct","sniper_scratch_minutes","sniper_scratch_loss_pct",
-                "sniper_max_hold_minutes","daily_profit_target_pct","daily_profit_secure_buffer_pct",
+                "sniper_max_hold_minutes","pulse_min_score","pulse_min_events_5s",
+                "pulse_min_buy_pressure_5s","pulse_min_unique_buyers_10s",
+                "pulse_max_m5_pct","pulse_cooldown_sec","pulse_eval_timeout_sec",
+                "daily_profit_target_pct","daily_profit_secure_buffer_pct",
                 "daily_de_risk_start_pct","daily_de_risk_multiplier","max_total_open_risk_pct",
                 "min_liquidity","min_market_risk","min_spot_market_quality","execution_cost_pct","cooldown_minutes"
             ]},
@@ -3076,6 +3339,7 @@ def dashboard():
             "profit_lock_enabled":b("profit_lock_enabled"),
             "capital_shield_enabled":b("capital_shield_enabled"),
             "sniper_enabled":b("sniper_enabled"),
+            "realtime_pulse_enabled":b("realtime_pulse_enabled"),
             "daily_target_lock_enabled":b("daily_target_lock_enabled"),
             "no_martingale":b("no_martingale"),
             "operating_mode":operating_mode()
@@ -3100,7 +3364,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.0"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.1"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
@@ -3202,6 +3466,10 @@ def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
         raise HTTPException(400,"stop_loss_pct must be 0.5..15")
     if "correlation_threshold" in vals and not (0.3<=vals["correlation_threshold"]<=0.99):
         raise HTTPException(400,"correlation_threshold must be 0.30..0.99")
+    if "pulse_min_score" in vals and not (50<=vals["pulse_min_score"]<=95):
+        raise HTTPException(400,"pulse_min_score must be 50..95")
+    if "pulse_min_events_5s" in vals and not (2<=vals["pulse_min_events_5s"]<=30):
+        raise HTTPException(400,"pulse_min_events_5s must be 2..30")
     if "daily_profit_target_pct" in vals and not (1<=vals["daily_profit_target_pct"]<=25):
         raise HTTPException(400,"daily_profit_target_pct must be 1..25")
     if "daily_de_risk_start_pct" in vals and not (0.5<=vals["daily_de_risk_start_pct"]<=20):
