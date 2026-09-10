@@ -1,4 +1,4 @@
-import os, asyncio, math, time, random
+import os, asyncio, math, time, random, json
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import httpx
@@ -8,9 +8,11 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "4.5.0"
+APP_VERSION = "5.0.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+LIVE_EXECUTION_LOCKED = True
 
 # Legacy public-price fallback only. Primary perp intelligence in V4.2 comes from Velocity Data API.
 PERP_UNIVERSE = {
@@ -126,6 +128,52 @@ class MarketSnapshot(Base):
     liquidity: Mapped[float] = mapped_column(Float, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
+class ExecutionEvent(Base):
+    __tablename__ = "execution_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    position_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    trade_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(50), index=True)
+    strategy: Mapped[str] = mapped_column(String(30), index=True)
+    phase: Mapped[str] = mapped_column(String(20), index=True)
+    side: Mapped[str] = mapped_column(String(10))
+    mid_price: Mapped[float] = mapped_column(Float)
+    fill_price: Mapped[float] = mapped_column(Float)
+    notional_usd: Mapped[float] = mapped_column(Float)
+    fee_bps: Mapped[float] = mapped_column(Float, default=0)
+    spread_bps: Mapped[float] = mapped_column(Float, default=0)
+    slippage_bps: Mapped[float] = mapped_column(Float, default=0)
+    impact_bps: Mapped[float] = mapped_column(Float, default=0)
+    latency_bps: Mapped[float] = mapped_column(Float, default=0)
+    adverse_bps: Mapped[float] = mapped_column(Float, default=0)
+    all_in_bps: Mapped[float] = mapped_column(Float, default=0)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+class SystemEvent(Base):
+    __tablename__ = "system_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    level: Mapped[str] = mapped_column(String(12), index=True)
+    code: Mapped[str] = mapped_column(String(50), index=True)
+    message: Mapped[str] = mapped_column(String(240))
+    detail: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+class DecisionLog(Base):
+    __tablename__ = "decision_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(50), index=True)
+    mint: Mapped[str] = mapped_column(String(120), index=True)
+    strategy: Mapped[str] = mapped_column(String(30), index=True)
+    operating_mode: Mapped[str] = mapped_column(String(12), index=True)
+    outcome: Mapped[str] = mapped_column(String(20), index=True)
+    reason: Mapped[str] = mapped_column(String(120))
+    signal_score: Mapped[float] = mapped_column(Float, default=0)
+    quality_score: Mapped[float] = mapped_column(Float, default=0)
+    route_quality: Mapped[float] = mapped_column(Float, default=0)
+    security_score: Mapped[float] = mapped_column(Float, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
 Base.metadata.create_all(engine)
 
 DEFAULTS = {
@@ -167,6 +215,35 @@ DEFAULTS = {
     "correlation_threshold": "0.80",
     "correlation_lookback_points": "20",
     "min_portfolio_weight": "0.35",
+    "execution_simulator_enabled": "true",
+    "spot_fee_bps": "30",
+    "perp_fee_bps": "10",
+    "base_spread_bps": "8",
+    "slippage_floor_bps": "2",
+    "impact_coefficient_bps": "40",
+    "simulated_latency_ms": "450",
+    "max_execution_cost_bps": "120",
+    "operating_mode": "PAPER",
+    "shadow_started_at": "",
+    "max_data_age_sec": "90",
+    "min_token_security_score": "60",
+    "security_scan_ttl_sec": "600",
+    "security_scan_top_n": "5",
+    "security_required_shadow": "true",
+    "security_hard_block_shadow": "true",
+    "min_route_quality": "55",
+    "spot_max_hold_minutes": "120",
+    "perp_max_hold_minutes": "240",
+    "reversal_exit_edge": "15",
+    "breakeven_trigger_pct": "6",
+    "breakeven_exit_pct": "0.5",
+    "readiness_min_trades": "100",
+    "readiness_min_pf": "1.15",
+    "readiness_min_shadow_hours": "24",
+    "readiness_max_drawdown_pct": "10",
+    "readiness_max_mc_below_start_pct": "35",
+    "readiness_min_wf_robust": "1",
+    "readiness_max_exec_bps": "80",
     "min_liquidity": "20000",
     "min_market_risk": "70",
     "execution_cost_pct": "0.50",
@@ -223,6 +300,16 @@ runtime = {
     "last_market_snapshot": 0,
     "last_snapshot_cleanup": 0,
     "last_portfolio_block": None,
+    "last_execution_block": None,
+    "execution_blocks": 0,
+    "token_security": {},
+    "last_spot_refresh": None,
+    "last_perp_refresh": None,
+    "last_successful_loop": None,
+    "engine_error_streak": 0,
+    "last_decision_log": {},
+    "last_event_log": {},
+    "last_research_report": None,
     "cooldowns": {},
     "strategy_pauses": {},
     "pause_until": None,
@@ -236,6 +323,180 @@ def auth(x_nova_key: Optional[str]):
 def nz(v, d=0.0):
     try: return float(v or d)
     except: return d
+
+
+def operating_mode():
+    mode=str(getv("operating_mode","PAPER")).upper()
+    return mode if mode in ("PAPER","SHADOW") else "PAPER"
+
+def iso_age_seconds(value):
+    if not value:return 10**9
+    try:
+        dt=datetime.fromisoformat(value)
+        if dt.tzinfo is None:dt=dt.replace(tzinfo=timezone.utc)
+        return max(0,(datetime.now(timezone.utc)-dt).total_seconds())
+    except:return 10**9
+
+def record_event(level,code_name,message,detail=None,dedupe_sec=180):
+    now=time.time()
+    key=f"{level}:{code_name}:{message}"
+    prev=runtime["last_event_log"].get(key,0)
+    if now-prev<dedupe_sec:return
+    runtime["last_event_log"][key]=now
+    try:
+        with SessionLocal() as s:
+            s.add(SystemEvent(
+                level=str(level)[:12],code=str(code_name)[:50],message=str(message)[:240],
+                detail=json.dumps(detail or {},default=str)[:8000],
+                created_at=datetime.now(timezone.utc)
+            ));s.commit()
+    except:pass
+
+def log_decision(c,strategy,outcome,reason,signal_score=0,quality_score=0,route_quality=0,security_score=0):
+    now=time.time()
+    key=f"{c.get('mint')}:{strategy}:{outcome}:{reason}"
+    if now-runtime["last_decision_log"].get(key,0)<120:return
+    runtime["last_decision_log"][key]=now
+    try:
+        with SessionLocal() as s:
+            s.add(DecisionLog(
+                symbol=str(c.get("symbol") or "?"),mint=str(c.get("mint") or ""),
+                strategy=strategy,operating_mode=operating_mode(),
+                outcome=str(outcome)[:20],reason=str(reason)[:120],
+                signal_score=nz(signal_score),quality_score=nz(quality_score),
+                route_quality=nz(route_quality),security_score=nz(security_score),
+                created_at=datetime.now(timezone.utc)
+            ));s.commit()
+    except:pass
+
+async def solana_rpc(client,method,params):
+    payload={"jsonrpc":"2.0","id":1,"method":method,"params":params}
+    r=await client.post(SOLANA_RPC_URL,json=payload,timeout=20)
+    r.raise_for_status()
+    body=r.json()
+    if body.get("error"):raise RuntimeError(str(body["error"]))
+    return body.get("result")
+
+async def scan_token_security(client,c,force=False):
+    if c.get("perp_eligible"):
+        return {"status":"N/A","score":100,"hard_block":False,"flags":[],"source":"PERP_MARKET"}
+    mint=str(c.get("mint") or "")
+    cached=runtime["token_security"].get(mint)
+    ttl=i("security_scan_ttl_sec")
+    if cached and not force and time.time()-cached.get("_ts",0)<ttl:
+        return {k:v for k,v in cached.items() if k!="_ts"}
+    try:
+        account=await solana_rpc(client,"getAccountInfo",[
+            mint,{"encoding":"jsonParsed","commitment":"confirmed"}
+        ])
+        value=(account or {}).get("value")
+        if not value:raise RuntimeError("mint account not found")
+        owner=str(value.get("owner") or "")
+        data=value.get("data") or {}
+        parsed=data.get("parsed") if isinstance(data,dict) else None
+        info=(parsed or {}).get("info") or {}
+        supply_raw=float(info.get("supply") or 0)
+        mint_auth=info.get("mintAuthority")
+        freeze_auth=info.get("freezeAuthority")
+
+        largest=await solana_rpc(client,"getTokenLargestAccounts",[
+            mint,{"commitment":"confirmed"}
+        ])
+        accts=(largest or {}).get("value") or []
+        amounts=[]
+        for x in accts:
+            try:amounts.append(float(x.get("amount") or 0))
+            except:pass
+        top1=(amounts[0]/supply_raw*100) if supply_raw>0 and amounts else 0
+        top5=(sum(amounts[:5])/supply_raw*100) if supply_raw>0 else 0
+        top10=(sum(amounts[:10])/supply_raw*100) if supply_raw>0 else 0
+
+        token_programs={
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        }
+        score=100.0;flags=[];hard=False
+        if owner not in token_programs:
+            score-=30;flags.append("unknown mint program");hard=True
+        if mint_auth:
+            score-=18;flags.append("mint authority active")
+        if freeze_auth:
+            score-=24;flags.append("freeze authority active");hard=True
+        if top1>=35:
+            score-=28;flags.append(f"top1 concentration {top1:.1f}%")
+        elif top1>=20:
+            score-=18;flags.append(f"top1 concentration {top1:.1f}%")
+        elif top1>=10:
+            score-=8;flags.append(f"top1 concentration {top1:.1f}%")
+        if top5>=75:
+            score-=22;flags.append(f"top5 concentration {top5:.1f}%")
+        elif top5>=55:
+            score-=12;flags.append(f"top5 concentration {top5:.1f}%")
+        age=nz(c.get("age_minutes"),999999)
+        if age<15:score-=12;flags.append("very new market")
+        elif age<60:score-=6;flags.append("new market")
+        liq=nz(c.get("liquidity"))
+        if liq<25000:score-=14;flags.append("thin liquidity")
+        elif liq<50000:score-=6;flags.append("modest liquidity")
+        mc=max(nz(c.get("market_cap")),1)
+        ratio=liq/mc
+        if ratio<0.01:score-=12;flags.append("low liquidity/market-cap ratio")
+        elif ratio<0.025:score-=6;flags.append("modest liquidity/market-cap ratio")
+
+        score=round(clamp(score,0,100),1)
+        status="PASS" if score>=75 and not hard else "WARN" if score>=45 and not hard else "BLOCK"
+        result={
+            "status":status,"score":score,"hard_block":hard,"flags":flags,
+            "mint_authority_active":bool(mint_auth),"freeze_authority_active":bool(freeze_auth),
+            "top1_pct":round(top1,2),"top5_pct":round(top5,2),"top10_pct":round(top10,2),
+            "program_owner":owner,"source":"SOLANA_RPC",
+            "note":"Largest-account concentration is approximate and can include LP, treasury or burn accounts."
+        }
+        runtime["token_security"][mint]={**result,"_ts":time.time()}
+        return result
+    except Exception as e:
+        result={
+            "status":"UNKNOWN","score":50.0,"hard_block":False,
+            "flags":[f"security scan unavailable: {str(e)[:120]}"],
+            "source":"SOLANA_RPC","note":"No contract-security conclusion was made."
+        }
+        runtime["token_security"][mint]={**result,"_ts":time.time()}
+        return result
+
+def security_coverage():
+    spots=[c for c in runtime.get("candidates",[]) if not c.get("perp_eligible")]
+    top=spots[:max(1,i("security_scan_top_n"))]
+    known=[c for c in top if (c.get("security") or {}).get("status") not in (None,"UNKNOWN")]
+    return {
+        "scanned_known":len(known),"target":len(top),
+        "coverage_pct":(len(known)/len(top)*100) if top else 100
+    }
+
+def source_health():
+    age=iso_age_seconds(runtime.get("last_successful_loop"))
+    spot_age=iso_age_seconds(runtime.get("last_spot_refresh"))
+    perp_age=iso_age_seconds(runtime.get("last_perp_refresh"))
+    max_age=f("max_data_age_sec")
+    reasons=[]
+    status="OK"
+    if not runtime.get("loop_alive"):
+        status="CRITICAL";reasons.append("engine loop not alive")
+    if age>max_age:
+        status="CRITICAL";reasons.append("market data stale")
+    elif runtime.get("engine_error_streak",0)>0:
+        status="WARN";reasons.append("recent engine errors")
+    if not runtime.get("velocity_source_ok"):
+        if status=="OK":status="WARN"
+        reasons.append("primary perp source unavailable; fallback may be active")
+    return {
+        "status":status,"reasons":reasons,
+        "loop_alive":runtime.get("loop_alive",False),
+        "last_loop_age_sec":round(age,1),
+        "spot_age_sec":round(spot_age,1),
+        "perp_age_sec":round(perp_age,1),
+        "velocity_source_ok":runtime.get("velocity_source_ok",False),
+        "engine_error_streak":runtime.get("engine_error_streak",0)
+    }
 
 def clamp(v,a,b):
     return max(a,min(b,v))
@@ -438,9 +699,11 @@ def score_pair(p, source_boost=0):
     vol_accel = max(0, min(100, 35 + 20 * math.log10(max(v5 / expected5, 0.05))))
 
     pc = p.get("priceChange") or {}
-    m5, h1 = nz(pc.get("m5")), nz(pc.get("h1"))
-    bull_momentum = max(0, min(100, 50 + m5 * 5.0 + h1 * 0.65))
-    bear_momentum = max(0, min(100, 50 - m5 * 5.0 - h1 * 0.65))
+    m5, h1, h6, h24 = nz(pc.get("m5")), nz(pc.get("h1")), nz(pc.get("h6")), nz(pc.get("h24"))
+    trend_alignment=(1 if m5>0 else -1)+(1 if h1>0 else -1)+(1 if h6>0 else -1)+(1 if h24>0 else -1)
+    trend_score=clamp(50+trend_alignment*10+h1*.35+h6*.12+h24*.04,0,100)
+    bull_momentum = max(0, min(100, 50 + m5 * 5.0 + h1 * 0.55 + h6*.08))
+    bear_momentum = max(0, min(100, 50 - m5 * 5.0 - h1 * 0.55 - h6*.08))
 
     liq = nz((p.get("liquidity") or {}).get("usd"))
     liquidity_score = max(0, min(100, 20 + 22 * math.log10(max(liq, 1) / 1000)))
@@ -486,7 +749,9 @@ def score_pair(p, source_boost=0):
         "market_risk": max(0,min(100,market_risk)),
         "buy_pressure": round(pressure,1),
         "volume_accel": round(vol_accel,1),
-        "m5": m5, "h1": h1, "liquidity": liq, "market_cap": fdv,
+        "trend_score": round(trend_score,1),
+        "trend_alignment": trend_alignment,
+        "m5": m5, "h1": h1, "h6": h6, "h24": h24, "liquidity": liq, "market_cap": fdv,
         "age_minutes": round(age_min,1), "volume_m5": v5,
         "buys_m5": int(buys5), "sells_m5": int(sells5),
     }
@@ -624,15 +889,29 @@ def positions_with_marks():
         for p in s.scalars(select(Position)).all():
             c=cands.get(p.mint)
             price=c["price"] if c else p.last_price
+            side=strategy_side(p.strategy)
+            leverage=strategy_leverage(p.strategy)
             ret=directional_return_pct(p,price)
             value=paper_position_value(p,price)
+            mark_execution_bps=0.0
+            if b("execution_simulator_enabled") and c and p.remaining_cost>0:
+                execution_notional=p.remaining_cost*leverage
+                est=execution_cost_estimate(c,p.strategy,execution_notional)
+                fill=simulated_fill_price(price,side,"MARK_EXIT",est.get("adverse_bps",0))
+                raw=directional_raw_return(p.entry_price,fill,side)
+                gross=max(0.0,p.remaining_cost*(1+raw*leverage))
+                fee=execution_notional*est.get("fee_bps",0)/10000.0
+                value=max(0.0,gross-fee)
+                ret=((value/max(p.remaining_cost,1e-9))-1)*100
+                mark_execution_bps=est.get("all_in_bps",0)
             out.append({
                 "id":p.id,"mint":p.mint,"symbol":p.symbol,"name":p.name,
-                "strategy":p.strategy,"side":strategy_side(p.strategy),
-                "leverage":strategy_leverage(p.strategy),
+                "strategy":p.strategy,"side":side,
+                "leverage":leverage,
                 "entry":p.entry_price,"price":price,
                 "return_pct":ret,"remaining_cost":p.remaining_cost,
                 "market_value":value,"locked_pnl":p.locked_pnl,
+                "mark_execution_bps":mark_execution_bps,
                 "opened_at":p.opened_at.isoformat()
             })
     return out
@@ -837,7 +1116,6 @@ def replay_strategy(rows,strategy,threshold,hold_minutes=None):
     hold_minutes=hold_minutes or i("replay_hold_minutes")
     stop=f("stop_loss_pct")
     take=f("replay_take_profit_pct")
-    fee=f("execution_cost_pct")*2
     leverage=f("perp_leverage") if strategy.startswith("PERP_") else 1.0
     side="SHORT" if strategy=="PERP_SHORT" else "LONG"
 
@@ -870,7 +1148,15 @@ def replay_strategy(rows,strategy,threshold,hold_minutes=None):
                 j+=1;continue
             raw=(exit_s.price/entry_price-1)*100
             gross=(raw if side=="LONG" else -raw)*leverage
-            ret=gross-fee*leverage
+            # Reconstruct a conservative round-trip cost estimate from the recorded snapshot.
+            proxy={
+                "liquidity":entry.liquidity,"open_interest_usd":entry.open_interest_usd,
+                "volatility_regime":entry.volatility_regime,"volatility_pct":0,
+                "m5":0
+            }
+            assumed_notional=max(50.0,f("start_balance")*f("max_position_pct")/100*leverage)
+            one_way=execution_cost_estimate(proxy,strategy,assumed_notional)["all_in_bps"]/100.0
+            ret=gross-one_way*2
             trades.append({
                 "mint":mint,"symbol":entry.symbol,"strategy":strategy,
                 "entry_score":snapshot_score(entry,strategy),
@@ -951,12 +1237,277 @@ def research_report():
     for s in strategies:
         replays[s]=replay_strategy(rows,s,base_threshold(s))
         walks[s]=walk_forward(rows,s)
-    return {
+    report={
         "version":APP_VERSION,"data":snapshot_stats(),
         "replay":replays,"walk_forward":walks,"monte_carlo":monte_carlo(),
         "note":"Replay uses snapshots recorded by NOVA after V4.4 deployment; it is not tick-level exchange backtesting."
     }
+    runtime["last_research_report"]=report
+    return report
 
+
+
+
+def suggested_strategy(c):
+    if c.get("perp_eligible"):
+        return "PERP_SHORT" if c.get("direction")=="SHORT" else "PERP_LONG"
+    return "PUMP_LONG" if nz(c.get("pump_score"))>=nz(c.get("scalp_score")) else "SCALP_LONG"
+
+def route_quality(c,strategy,notional_usd=None):
+    if notional_usd:
+        notional=nz(notional_usd)
+    else:
+        leverage=strategy_leverage(strategy)
+        notional=max(25.0,f("start_balance")*f("max_position_pct")/100*leverage*.65)
+    source=str(c.get("data_source") or "UNKNOWN")
+    source_q={"VELOCITY":95,"DEXSCREENER":88,"DEX_FALLBACK":55}.get(source,55)
+    if c.get("perp_eligible"):
+        age=iso_age_seconds(runtime.get("last_perp_refresh"))
+    else:
+        age=iso_age_seconds(runtime.get("last_spot_refresh"))
+    freshness=clamp(100-age/max(f("max_data_age_sec"),1)*70,0,100)
+    sec=(c.get("security") or {})
+    security_q=nz(sec.get("score"),nz(c.get("market_risk"),50)) if not c.get("perp_eligible") else nz(c.get("market_risk"),70)
+    est=execution_cost_estimate(c,strategy,notional)
+    max_cost=max(f("max_execution_cost_bps"),1)
+    execution_q=clamp(100-est.get("all_in_bps",0)/max_cost*70,0,100)
+    q=source_q*.30+freshness*.20+execution_q*.25+security_q*.25
+    venue="VELOCITY-PERP-SHADOW" if source=="VELOCITY" else "DEXSCREENER-SPOT-SHADOW" if not c.get("perp_eligible") else "PERP-FALLBACK-SHADOW"
+    return {
+        "venue":venue,"quality":round(clamp(q,0,100),1),"source_quality":source_q,
+        "freshness_quality":round(freshness,1),"execution_quality":round(execution_q,1),
+        "security_quality":round(security_q,1),"execution":est
+    }
+
+def route_gate(c,strategy):
+    route=route_quality(c,strategy)
+    if operating_mode()=="SHADOW" and c.get("perp_eligible") and c.get("data_source")!="VELOCITY":
+        return False,"shadow requires primary perp source",route
+    if route["quality"]<f("min_route_quality"):
+        return False,"route quality too low",route
+    return True,"ok",route
+
+def signal_quality(c,strategy,signal_score):
+    pw=portfolio_weight(strategy)
+    route=route_quality(c,strategy)
+    sec=(c.get("security") or {})
+    sq=nz(sec.get("score"),85 if c.get("perp_eligible") else 50)
+    market=nz(c.get("market_risk"),50)
+    quality=nz(signal_score)
+    quality*=0.58+0.42*clamp(pw,0,1)
+    quality*=0.70+0.30*route["quality"]/100
+    quality*=0.80+0.20*clamp(sq,0,100)/100
+    quality*=0.85+0.15*clamp(market,0,100)/100
+    return round(clamp(quality,0,100),2),route
+
+def token_security_status():
+    spots=[c for c in runtime.get("candidates",[]) if not c.get("perp_eligible")]
+    rows=[]
+    for c in spots[:20]:
+        sec=c.get("security") or {"status":"UNKNOWN","score":50,"flags":[]}
+        rows.append({
+            "mint":c.get("mint"),"symbol":c.get("symbol"),"status":sec.get("status"),
+            "score":sec.get("score"),"hard_block":sec.get("hard_block",False),
+            "top1_pct":sec.get("top1_pct"),"top5_pct":sec.get("top5_pct"),
+            "mint_authority_active":sec.get("mint_authority_active"),
+            "freeze_authority_active":sec.get("freeze_authority_active"),
+            "flags":sec.get("flags",[]),"source":sec.get("source")
+        })
+    return {"coverage":security_coverage(),"tokens":rows}
+
+def system_events(limit=40):
+    with SessionLocal() as s:
+        rows=s.scalars(select(SystemEvent).order_by(SystemEvent.id.desc()).limit(limit)).all()
+    return [{
+        "level":x.level,"code":x.code,"message":x.message,
+        "detail":x.detail,"created_at":x.created_at.isoformat()
+    } for x in rows]
+
+def recent_decisions(limit=40):
+    with SessionLocal() as s:
+        rows=s.scalars(select(DecisionLog).order_by(DecisionLog.id.desc()).limit(limit)).all()
+    return [{
+        "symbol":x.symbol,"strategy":x.strategy,"mode":x.operating_mode,
+        "outcome":x.outcome,"reason":x.reason,"signal_score":x.signal_score,
+        "quality_score":x.quality_score,"route_quality":x.route_quality,
+        "security_score":x.security_score,"created_at":x.created_at.isoformat()
+    } for x in rows]
+
+def shadow_hours():
+    if operating_mode()!="SHADOW":return 0.0
+    v=getv("shadow_started_at","")
+    if not v:return 0.0
+    return iso_age_seconds(v)/3600.0
+
+def live_readiness():
+    m=metrics()
+    ex=execution_stats(300)
+    health=source_health()
+    sec=security_coverage()
+    rr=runtime.get("last_research_report")
+    robust=0;mc={}
+    if rr:
+        robust=sum(1 for x in (rr.get("walk_forward") or {}).values() if x.get("ready") and x.get("robust"))
+        mc=rr.get("monte_carlo") or {}
+    checks=[]
+    def add(name,passed,value,target,critical=True):
+        checks.append({"name":name,"pass":bool(passed),"value":value,"target":target,"critical":critical})
+    add("closed paper trades",m["trades"]>=i("readiness_min_trades"),m["trades"],f">= {i('readiness_min_trades')}")
+    add("profit factor",m["profit_factor"]>=f("readiness_min_pf"),round(m["profit_factor"],2),f">= {f('readiness_min_pf')}")
+    add("positive expectancy",m["expectancy"]>0,round(m["expectancy"],3),"> 0")
+    add("max drawdown",abs(m["max_drawdown_pct"])<=f("readiness_max_drawdown_pct"),round(m["max_drawdown_pct"],2),f"<= {f('readiness_max_drawdown_pct')}%")
+    add("execution simulator",b("execution_simulator_enabled"),b("execution_simulator_enabled"),True)
+    add("execution cost",ex["fills"]>=20 and ex["avg_all_in_bps"]<=f("readiness_max_exec_bps"),
+        round(ex["avg_all_in_bps"],1),f"<= {f('readiness_max_exec_bps')} bp after >=20 fills")
+    add("market data health",health["status"]=="OK",health["status"],"OK")
+    add("security coverage",sec["coverage_pct"]>=60,round(sec["coverage_pct"],1),">= 60%",False)
+    add("shadow observation",shadow_hours()>=f("readiness_min_shadow_hours"),round(shadow_hours(),2),f">= {f('readiness_min_shadow_hours')}h")
+    add("walk-forward robust strategies",robust>=i("readiness_min_wf_robust"),robust,f">= {i('readiness_min_wf_robust')}")
+    mc_ok=bool(mc.get("ready")) and nz(mc.get("prob_finish_below_start"),100)<=f("readiness_max_mc_below_start_pct")
+    add("monte carlo downside",mc_ok,round(nz(mc.get("prob_finish_below_start"),100),1),f"<= {f('readiness_max_mc_below_start_pct')}%")
+    passed=sum(1 for x in checks if x["pass"])
+    score=round(passed/max(len(checks),1)*100)
+    critical_fail=[x["name"] for x in checks if x["critical"] and not x["pass"]]
+    status="READY_FOR_MANUAL_REVIEW" if not critical_fail and score>=90 else "OBSERVING" if score>=55 else "NOT_READY"
+    return {
+        "score":score,"status":status,"live_execution_locked":LIVE_EXECUTION_LOCKED,
+        "shadow_hours":round(shadow_hours(),2),
+        "checks":checks,"critical_failures":critical_fail,
+        "message":"Passing this gate does not guarantee profitability and does not unlock live execution."
+    }
+
+def volatility_cost_multiplier(regime):
+    return {
+        "LOW":0.75,"NORMAL":1.0,"HIGH":1.65,"EXTREME":2.50,
+        "WARMUP":1.15,"SPOT":1.0,"FALLBACK":1.25,"UNKNOWN":1.15
+    }.get(str(regime or "UNKNOWN").upper(),1.15)
+
+def execution_reference_depth(c,strategy):
+    if str(strategy).startswith("PERP_"):
+        oi=max(nz(c.get("open_interest_usd")),0)
+        # OI is not order-book depth. This is deliberately conservative proxy depth.
+        return max(100000.0,oi*0.01)
+    return max(1000.0,nz(c.get("liquidity")))
+
+def execution_cost_estimate(c,strategy,notional_usd):
+    notional=max(1.0,nz(notional_usd))
+    perp=str(strategy).startswith("PERP_")
+    fee_bps=f("perp_fee_bps") if perp else f("spot_fee_bps")
+    depth=execution_reference_depth(c,strategy)
+    vol_mult=volatility_cost_multiplier(c.get("volatility_regime"))
+
+    # Spread widens as reference depth falls. We charge half spread per fill.
+    depth_scale=clamp(math.sqrt(100000.0/max(depth,1.0)),0.45,4.0)
+    full_spread_bps=f("base_spread_bps")*depth_scale*vol_mult
+    half_spread_bps=full_spread_bps/2.0
+
+    ratio=clamp(notional/max(depth,1.0),0,1)
+    impact_bps=f("impact_coefficient_bps")*math.sqrt(ratio)*vol_mult
+    slippage_bps=f("slippage_floor_bps")*vol_mult + impact_bps*.35
+
+    latency_ms=max(0.0,f("simulated_latency_ms"))
+    vol_pct=abs(nz(c.get("volatility_pct")))
+    if vol_pct<=0:
+        vol_pct=abs(nz(c.get("m5")))*0.15
+    latency_bps=(vol_pct*100.0)*math.sqrt(max(latency_ms,1.0)/15000.0)*0.25
+
+    adverse_bps=half_spread_bps+slippage_bps+impact_bps+latency_bps
+    all_in_bps=fee_bps+adverse_bps
+    return {
+        "fee_bps":round(fee_bps,3),
+        "spread_bps":round(full_spread_bps,3),
+        "half_spread_bps":round(half_spread_bps,3),
+        "slippage_bps":round(slippage_bps,3),
+        "impact_bps":round(impact_bps,3),
+        "latency_bps":round(latency_bps,3),
+        "adverse_bps":round(adverse_bps,3),
+        "all_in_bps":round(all_in_bps,3),
+        "latency_ms":round(latency_ms,1),
+        "reference_depth_usd":round(depth,2),
+        "order_to_depth_pct":round(ratio*100,4),
+    }
+
+def simulated_fill_price(mid_price,side,phase,adverse_bps):
+    mid=max(nz(mid_price),1e-12)
+    a=max(0,nz(adverse_bps))/10000.0
+    side=str(side).upper()
+    phase=str(phase).upper()
+    # Adverse price direction:
+    # LONG entry buys higher; LONG exit sells lower.
+    # SHORT entry sells lower; SHORT exit buys higher.
+    higher=(side=="LONG" and phase=="ENTRY") or (side=="SHORT" and phase!="ENTRY")
+    return mid*(1+a if higher else 1-a)
+
+def record_execution_event(position_id,trade_id,c,strategy,phase,notional_usd,mid_price,fill_price,est):
+    with SessionLocal() as s:
+        s.add(ExecutionEvent(
+            position_id=position_id,trade_id=trade_id,
+            symbol=str(c.get("symbol") or "?"),strategy=strategy,phase=phase,
+            side=strategy_side(strategy),mid_price=mid_price,fill_price=fill_price,
+            notional_usd=notional_usd,fee_bps=est["fee_bps"],spread_bps=est["spread_bps"],
+            slippage_bps=est["slippage_bps"],impact_bps=est["impact_bps"],
+            latency_bps=est["latency_bps"],adverse_bps=est["adverse_bps"],
+            all_in_bps=est["all_in_bps"],latency_ms=est["latency_ms"],
+            created_at=datetime.now(timezone.utc)
+        ))
+        s.commit()
+
+def execution_quality_gate(c,strategy,notional_usd):
+    if not b("execution_simulator_enabled"):
+        return True,"ok",{"all_in_bps":0,"adverse_bps":0,"fee_bps":0}
+    est=execution_cost_estimate(c,strategy,notional_usd)
+    if est["all_in_bps"]>f("max_execution_cost_bps"):
+        runtime["execution_blocks"]+=1
+        runtime["last_execution_block"]={
+            "time":datetime.now(timezone.utc).isoformat(),
+            "symbol":c.get("symbol"),"strategy":strategy,
+            "reason":"execution cost too high","estimate":est
+        }
+        return False,"execution cost too high",est
+    return True,"ok",est
+
+def execution_stats(limit=300):
+    with SessionLocal() as s:
+        rows=s.scalars(select(ExecutionEvent).order_by(ExecutionEvent.id.desc()).limit(limit)).all()
+    if not rows:
+        return {
+            "fills":0,"avg_all_in_bps":0,"avg_adverse_bps":0,"avg_fee_bps":0,
+            "avg_impact_bps":0,"avg_latency_bps":0,"entry_fills":0,"exit_fills":0,
+            "blocks":runtime["execution_blocks"],"last_block":runtime["last_execution_block"],
+            "recent":[]
+        }
+    def avg(attr):
+        return sum(getattr(x,attr) for x in rows)/len(rows)
+    recent=[{
+        "symbol":x.symbol,"strategy":x.strategy,"phase":x.phase,"side":x.side,
+        "mid_price":x.mid_price,"fill_price":x.fill_price,"notional_usd":x.notional_usd,
+        "all_in_bps":x.all_in_bps,"adverse_bps":x.adverse_bps,"fee_bps":x.fee_bps,
+        "impact_bps":x.impact_bps,"latency_bps":x.latency_bps,
+        "created_at":x.created_at.isoformat()
+    } for x in rows[:20]]
+    return {
+        "fills":len(rows),
+        "avg_all_in_bps":round(avg("all_in_bps"),3),
+        "avg_adverse_bps":round(avg("adverse_bps"),3),
+        "avg_fee_bps":round(avg("fee_bps"),3),
+        "avg_impact_bps":round(avg("impact_bps"),3),
+        "avg_latency_bps":round(avg("latency_bps"),3),
+        "entry_fills":sum(1 for x in rows if x.phase=="ENTRY"),
+        "exit_fills":sum(1 for x in rows if x.phase!="ENTRY"),
+        "blocks":runtime["execution_blocks"],
+        "last_block":runtime["last_execution_block"],
+        "recent":recent
+    }
+
+def planned_collateral(c,strategy):
+    m=metrics()
+    leverage=max(1.0,min(2.0,strategy_leverage(strategy)))
+    rm=risk_multiplier()
+    pw=portfolio_weight(strategy)
+    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw
+    collateral=risk_budget/max((f("stop_loss_pct")/100)*leverage,0.001)
+    collateral=min(collateral,m["equity"]*f("max_position_pct")/100,f("cash"))
+    return max(0.0,collateral)
 
 def market_regime():
     cands=runtime.get("candidates") or []
@@ -1306,10 +1857,15 @@ def adaptive_status():
 def gate(c,strategy=None):
     if b("killed"): return False,"kill switch"
     if not b("bot_enabled"): return False,"bot stopped"
+    health=source_health()
+    if health["last_loop_age_sec"]>f("max_data_age_sec"): return False,"stale market data"
+    if operating_mode()=="SHADOW" and not b("execution_simulator_enabled"):
+        return False,"shadow requires execution simulator"
     if runtime["pause_until"] and datetime.now(timezone.utc)<runtime["pause_until"]: return False,"loss pause"
     if strategy:
         spu=runtime["strategy_pauses"].get(strategy)
         if spu and datetime.now(timezone.utc)<spu:return False,"strategy adaptive pause"
+
     if c.get("perp_eligible"):
         if c.get("data_source")=="VELOCITY" and c.get("open_interest_usd",0) < f("min_perp_oi_usd"):
             return False,"low perp open interest"
@@ -1319,8 +1875,20 @@ def gate(c,strategy=None):
             return False,"extreme funding"
         if b("block_extreme_volatility") and c.get("volatility_regime")=="EXTREME":
             return False,"extreme volatility"
+        if operating_mode()=="SHADOW" and c.get("data_source")!="VELOCITY":
+            return False,"shadow requires primary perp source"
     else:
         if c["liquidity"] < f("min_liquidity"): return False,"low liquidity"
+        sec=c.get("security") or {}
+        sec_status=sec.get("status","UNKNOWN")
+        sec_score=nz(sec.get("score"),50)
+        if sec_status!="UNKNOWN" and sec_score<f("min_token_security_score"):
+            return False,"token security score too low"
+        if operating_mode()=="SHADOW" and b("security_required_shadow") and sec_status=="UNKNOWN":
+            return False,"shadow requires token security scan"
+        if operating_mode()=="SHADOW" and b("security_hard_block_shadow") and sec.get("hard_block"):
+            return False,"shadow token security hard block"
+
     if c["market_risk"] < f("min_market_risk"): return False,"market risk gate"
     if strategy and strategy_side(strategy)=="SHORT" and not c.get("perp_eligible"):
         return False,"short unavailable for spot-only token"
@@ -1332,6 +1900,8 @@ def gate(c,strategy=None):
     start=f("start_balance")
     if today_realized() <= -(start*f("daily_loss_limit_pct")/100): return False,"daily loss limit"
     if strategy:
+        rok,rreason,rdetail=route_gate(c,strategy)
+        if not rok:return False,rreason
         pok,preason,pdetail=portfolio_gate(c,strategy)
         if not pok:
             runtime["last_portfolio_block"]={
@@ -1344,27 +1914,33 @@ def gate(c,strategy=None):
 def open_position(c,strategy):
     ok,reason=gate(c,strategy)
     if not ok:return False,reason
-    m=metrics()
     leverage=max(1.0,min(2.0,strategy_leverage(strategy)))
-    rm=risk_multiplier()
-    pw=portfolio_weight(strategy)
-    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw
-    collateral=risk_budget/max((f("stop_loss_pct")/100)*leverage,0.001)
-    collateral=min(collateral,m["equity"]*f("max_position_pct")/100,f("cash"))
+    collateral=planned_collateral(c,strategy)
     if collateral<5:return False,"position too small"
-    open_fee=collateral*leverage*f("execution_cost_pct")/100
-    cash_need=collateral+open_fee
+
+    execution_notional=collateral*leverage
+    eok,ereason,est=execution_quality_gate(c,strategy,execution_notional)
+    if not eok:return False,ereason
+
+    mid_price=nz(c.get("price"))
+    side=strategy_side(strategy)
+    fill_price=simulated_fill_price(mid_price,side,"ENTRY",est.get("adverse_bps",0)) if b("execution_simulator_enabled") else mid_price
+    fee=execution_notional*est.get("fee_bps",0)/10000.0 if b("execution_simulator_enabled") else collateral*f("execution_cost_pct")/100
+    cash_need=collateral+fee
     if cash_need>f("cash"): return False,"cash"
+
     setv("cash",f("cash")-cash_need)
     now=datetime.now(timezone.utc)
+    position_id=None
     with SessionLocal() as s:
         pos=Position(
             mint=c["mint"],symbol=c["symbol"],name=c["name"],strategy=strategy,
-            entry_price=c["price"],last_price=c["price"],peak_price=c["price"],
-            initial_notional=collateral,remaining_cost=collateral,locked_pnl=-open_fee,
+            entry_price=fill_price,last_price=mid_price,peak_price=mid_price,
+            initial_notional=collateral,remaining_cost=collateral,locked_pnl=-fee,
             opened_at=now
         )
         s.add(pos);s.flush()
+        position_id=pos.id
         s.add(PositionFeature(
             position_id=pos.id,strategy=strategy,entry_score=strategy_entry_score(strategy,c),
             long_score=nz(c.get("long_score")),short_score=nz(c.get("short_score")),
@@ -1374,6 +1950,8 @@ def open_position(c,strategy):
             volatility_regime=str(c.get("volatility_regime") or "UNKNOWN"),created_at=now
         ))
         s.commit()
+    if b("execution_simulator_enabled"):
+        record_execution_event(position_id,None,c,strategy,"ENTRY",execution_notional,mid_price,fill_price,est)
     return True,"opened"
 
 def partial_sell(p, c, fraction):
@@ -1382,27 +1960,61 @@ def partial_sell(p, c, fraction):
     if cost_basis<=0:return
     side=strategy_side(p.strategy)
     leverage=strategy_leverage(p.strategy)
-    raw=directional_raw_return(p.entry_price,c["price"],side)
+    mid_price=nz(c.get("price"))
+    execution_notional=cost_basis*leverage
+    est=execution_cost_estimate(c,p.strategy,execution_notional) if b("execution_simulator_enabled") else {
+        "fee_bps":f("execution_cost_pct")*100,"adverse_bps":0,"spread_bps":0,
+        "slippage_bps":0,"impact_bps":0,"latency_bps":0,"all_in_bps":f("execution_cost_pct")*100,
+        "latency_ms":0
+    }
+    fill_price=simulated_fill_price(mid_price,side,"PARTIAL_EXIT",est.get("adverse_bps",0)) if b("execution_simulator_enabled") else mid_price
+    raw=directional_raw_return(p.entry_price,fill_price,side)
     gross_return=max(0.0,cost_basis*(1+raw*leverage))
-    fee=cost_basis*leverage*f("execution_cost_pct")/100
+    fee=execution_notional*est.get("fee_bps",0)/10000.0
     net=max(0.0,gross_return-fee)
     pnl=net-cost_basis
     setv("cash",f("cash")+net)
     p.remaining_cost-=cost_basis
     p.locked_pnl+=pnl
+    if b("execution_simulator_enabled"):
+        record_execution_event(p.id,None,c,p.strategy,"PARTIAL_EXIT",execution_notional,mid_price,fill_price,est)
 
 def close_position(p,c,reason):
     side=strategy_side(p.strategy)
     leverage=strategy_leverage(p.strategy)
-    raw=directional_raw_return(p.entry_price,c["price"],side)
+    mid_price=nz(c.get("price"))
+    execution_notional=p.remaining_cost*leverage
+    est=execution_cost_estimate(c,p.strategy,execution_notional) if b("execution_simulator_enabled") else {
+        "fee_bps":f("execution_cost_pct")*100,"adverse_bps":0,"spread_bps":0,
+        "slippage_bps":0,"impact_bps":0,"latency_bps":0,"all_in_bps":f("execution_cost_pct")*100,
+        "latency_ms":0
+    }
+    fill_price=simulated_fill_price(mid_price,side,"EXIT",est.get("adverse_bps",0)) if b("execution_simulator_enabled") else mid_price
+    raw=directional_raw_return(p.entry_price,fill_price,side)
     gross_return=max(0.0,p.remaining_cost*(1+raw*leverage))
-    fee=p.remaining_cost*leverage*f("execution_cost_pct")/100
+    fee=execution_notional*est.get("fee_bps",0)/10000.0
     net=max(0.0,gross_return-fee)
     rem_pnl=net-p.remaining_cost
-    total=p.locked_pnl+rem_pnl
-    setv("cash",f("cash")+net)
+
+    # Approximate funding carry for paper perps.
+    funding_pnl=0.0
+    pf_snapshot=None
+    if str(p.strategy).startswith("PERP_"):
+        with SessionLocal() as s:
+            pf_snapshot=s.scalar(select(PositionFeature).where(PositionFeature.position_id==p.id))
+        if pf_snapshot:
+            hours=max(0,(datetime.now(timezone.utc)-(p.opened_at if p.opened_at.tzinfo else p.opened_at.replace(tzinfo=timezone.utc))).total_seconds()/3600)
+            avg_funding=(nz(pf_snapshot.funding_rate)+nz(c.get("funding_rate")))/2.0
+            avg_collateral=(p.initial_notional+p.remaining_cost)/2.0
+            signed=-1 if side=="LONG" else 1
+            funding_pnl=signed*avg_funding*hours*avg_collateral*leverage
+            funding_pnl=clamp(funding_pnl,-p.initial_notional*.05,p.initial_notional*.05)
+
+    total=p.locked_pnl+rem_pnl+funding_pnl
+    setv("cash",f("cash")+net+funding_pnl)
     pnl_pct=total/max(p.initial_notional,1e-9)*100
     closed=datetime.now(timezone.utc)
+    trade_id=None
     with SessionLocal() as s:
         obj=s.get(Position,p.id)
         if not obj:return
@@ -1410,6 +2022,7 @@ def close_position(p,c,reason):
         tr=Trade(mint=p.mint,symbol=p.symbol,strategy=p.strategy,pnl=total,pnl_pct=pnl_pct,
                  reason=reason,opened_at=p.opened_at,closed_at=closed)
         s.add(tr);s.flush()
+        trade_id=tr.id
         if pf:
             s.add(TradeFeature(
                 trade_id=tr.id,strategy=p.strategy,entry_score=pf.entry_score,
@@ -1419,7 +2032,11 @@ def close_position(p,c,reason):
             ))
             s.delete(pf)
         s.delete(obj);s.commit()
+    if b("execution_simulator_enabled"):
+        record_execution_event(p.id,trade_id,c,p.strategy,"EXIT",execution_notional,mid_price,fill_price,est)
     runtime["cooldowns"][p.mint]=time.time()+i("cooldown_minutes")*60
+    record_event("INFO","POSITION_CLOSED",f"{p.symbol} {p.strategy} closed: {reason}",
+                 {"pnl":round(total,4),"pnl_pct":round(pnl_pct,3),"funding_pnl":round(funding_pnl,4)})
     maybe_pause_strategy(p.strategy)
     if consecutive_losses()>=i("max_consecutive_losses"):
         runtime["pause_until"]=datetime.now(timezone.utc)+timedelta(minutes=i("loss_pause_minutes"))
@@ -1445,11 +2062,20 @@ def manage_positions():
             ret=directional_return_pct(obj,c["price"])
             peak=directional_return_pct(obj,obj.peak_price)
             pull=ret-peak
-            prevliq=runtime["prev_liq"].get(obj.mint,c["liquidity"])
+            prevliq=runtime["prev_liq"].get(obj.mint,c.get("liquidity",0))
+            opened=obj.opened_at if obj.opened_at.tzinfo else obj.opened_at.replace(tzinfo=timezone.utc)
+            held_minutes=max(0,(datetime.now(timezone.utc)-opened).total_seconds()/60)
+            max_hold=f("perp_max_hold_minutes") if str(obj.strategy).startswith("PERP_") else f("spot_max_hold_minutes")
             reason=None
 
             if ret<=-f("stop_loss_pct"):
                 reason="STOP_LOSS"
+            elif peak>=f("breakeven_trigger_pct") and ret<=f("breakeven_exit_pct"):
+                reason="BREAK_EVEN_PROTECT"
+            elif held_minutes>=max_hold:
+                reason="TIME_STOP"
+            elif str(obj.strategy).startswith("PERP_") and c.get("direction") in ("LONG","SHORT") and c.get("direction")!=side and nz(c.get("direction_edge"))>=f("reversal_exit_edge"):
+                reason="SIGNAL_REVERSAL"
             elif not str(obj.strategy).startswith("PERP_") and prevliq>0 and c["liquidity"]<prevliq*.65:
                 reason="LIQUIDITY_DROP"
             elif side=="LONG" and c["buy_pressure"]<24 and ret>0:
@@ -1479,9 +2105,9 @@ def choose_entry():
         if c.get("perp_eligible"):
             if c.get("data_source")=="VELOCITY":
                 if c.get("direction")=="LONG" and c["long_score"]>=effective_threshold("PERP_LONG",c):
-                    opportunities.append((c["long_score"]+c.get("direction_edge",0)*.25,c,"PERP_LONG"))
+                    opportunities.append((c["long_score"],c,"PERP_LONG"))
                 elif c.get("direction")=="SHORT" and c["short_score"]>=effective_threshold("PERP_SHORT",c):
-                    opportunities.append((c["short_score"]+c.get("direction_edge",0)*.25,c,"PERP_SHORT"))
+                    opportunities.append((c["short_score"],c,"PERP_SHORT"))
             else:
                 if c["long_score"]>=effective_threshold("PERP_LONG",c):
                     opportunities.append((c["long_score"],c,"PERP_LONG"))
@@ -1493,29 +2119,46 @@ def choose_entry():
             if c["scalp_score"]>=effective_threshold("SCALP_LONG",c):
                 opportunities.append((c["scalp_score"],c,"SCALP_LONG"))
 
-    weighted=[]
-    for score,c,strategy in opportunities:
-        pw=portfolio_weight(strategy)
-        weighted.append((score*max(pw,0.01),score,pw,c,strategy))
-    weighted.sort(key=lambda x:x[0],reverse=True)
-    for weighted_score,score,pw,c,strategy in weighted:
-        ok,_=gate(c,strategy)
-        if ok:
-            open_position(c,strategy)
+    ranked=[]
+    for signal,c,strategy in opportunities:
+        quality,route=signal_quality(c,strategy,signal)
+        ranked.append((quality,signal,route,c,strategy))
+    ranked.sort(key=lambda x:x[0],reverse=True)
+
+    for quality,signal,route,c,strategy in ranked:
+        ok,reason=gate(c,strategy)
+        sec_score=nz((c.get("security") or {}).get("score"),100 if c.get("perp_eligible") else 50)
+        if not ok:
+            log_decision(c,strategy,"BLOCKED",reason,signal,quality,route.get("quality",0),sec_score)
+            continue
+        opened,oreason=open_position(c,strategy)
+        if opened:
+            log_decision(c,strategy,"OPENED","entry accepted",signal,quality,route.get("quality",0),sec_score)
+            record_event("INFO","POSITION_OPENED",f"{c.get('symbol')} {strategy} opened",
+                         {"mode":operating_mode(),"signal":signal,"quality":quality,
+                          "route_quality":route.get("quality"),"security_score":sec_score})
             return
+        log_decision(c,strategy,"BLOCKED",oreason,signal,quality,route.get("quality",0),sec_score)
 
 async def engine_loop():
     runtime["loop_alive"]=True
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Paper/4.5"}) as client:
+    record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.0"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
                 now=time.time()
+                now_iso=datetime.now(timezone.utc).isoformat()
                 if now-last_discovery>60 or not addresses:
                     addresses,boosts=await discover(client);last_discovery=now
+
                 spot_pairs=await fetch_pairs(client,addresses,boosts)
+                if spot_pairs:
+                    runtime["last_spot_refresh"]=now_iso
+
                 velocity_raw=await fetch_velocity_markets(client)
                 if velocity_raw:
+                    runtime["last_perp_refresh"]=now_iso
                     perp_pairs=[perp_intelligence(v) for v in velocity_raw]
                 else:
                     perp_pairs=await fetch_legacy_perp_pairs(client)
@@ -1524,17 +2167,52 @@ async def engine_loop():
                 for c in perp_pairs:merged[c["mint"]]=c
                 pairs=list(merged.values())
                 pairs.sort(key=lambda x:max(x["pump_score"],x["scalp_score"],x["long_score"],x["short_score"]),reverse=True)
+
                 if pairs:
+                    # Security scans are real Solana RPC reads and cached to protect RPC limits.
+                    spot_ranked=[c for c in pairs if not c.get("perp_eligible")]
+                    scan_n=max(1,min(12,i("security_scan_top_n")))
+                    for c in spot_ranked[:scan_n]:
+                        c["security"]=await scan_token_security(client,c)
+                    for c in spot_ranked[scan_n:]:
+                        cached=runtime["token_security"].get(c["mint"])
+                        c["security"]={k:v for k,v in cached.items() if k!="_ts"} if cached else {
+                            "status":"UNKNOWN","score":50.0,"hard_block":False,
+                            "flags":["not scanned in current top-N window"],"source":"SOLANA_RPC"
+                        }
+                    for c in pairs:
+                        if c.get("perp_eligible"):
+                            c["security"]={"status":"N/A","score":100,"hard_block":False,"flags":[],"source":"PERP_MARKET"}
+                        st=suggested_strategy(c)
+                        signal=strategy_entry_score(st,c)
+                        quality,route=signal_quality(c,st,signal)
+                        c["best_strategy"]=st
+                        c["quality_score"]=quality
+                        c["route"]=route
+
                     runtime["candidates"]=pairs
-                    runtime["last_refresh"]=datetime.now(timezone.utc).isoformat()
+                    runtime["last_refresh"]=now_iso
+                    runtime["last_successful_loop"]=now_iso
+                    runtime["engine_error_streak"]=0
                     manage_positions()
                     choose_entry()
                     record_equity_snapshot()
                     record_market_snapshots(pairs)
                     for c in pairs:runtime["prev_liq"][c["mint"]]=c.get("liquidity",0)
+
+                    h=source_health()
+                    if h["status"]=="WARN":
+                        record_event("WARN","DATA_HEALTH","Market data health warning",h)
+                else:
+                    runtime["engine_error_streak"]+=1
+                    record_event("WARN","NO_CANDIDATES","No candidates returned by market sources",{},dedupe_sec=300)
+
                 runtime["last_error"]=None if pairs else runtime["last_error"]
             except Exception as e:
+                runtime["engine_error_streak"]+=1
                 runtime["last_error"]=str(e)
+                record_event("ERROR","ENGINE_LOOP_ERROR",str(e)[:220],
+                             {"streak":runtime["engine_error_streak"]},dedupe_sec=180)
             await asyncio.sleep(15)
 
 @app.on_event("startup")
@@ -1576,6 +2254,33 @@ class SettingsIn(BaseModel):
     correlation_threshold: Optional[float]=None
     correlation_lookback_points: Optional[int]=None
     min_portfolio_weight: Optional[float]=None
+    execution_simulator_enabled: Optional[bool]=None
+    spot_fee_bps: Optional[float]=None
+    perp_fee_bps: Optional[float]=None
+    base_spread_bps: Optional[float]=None
+    slippage_floor_bps: Optional[float]=None
+    impact_coefficient_bps: Optional[float]=None
+    simulated_latency_ms: Optional[float]=None
+    max_execution_cost_bps: Optional[float]=None
+    max_data_age_sec: Optional[float]=None
+    min_token_security_score: Optional[float]=None
+    security_scan_ttl_sec: Optional[int]=None
+    security_scan_top_n: Optional[int]=None
+    security_required_shadow: Optional[bool]=None
+    security_hard_block_shadow: Optional[bool]=None
+    min_route_quality: Optional[float]=None
+    spot_max_hold_minutes: Optional[float]=None
+    perp_max_hold_minutes: Optional[float]=None
+    reversal_exit_edge: Optional[float]=None
+    breakeven_trigger_pct: Optional[float]=None
+    breakeven_exit_pct: Optional[float]=None
+    readiness_min_trades: Optional[int]=None
+    readiness_min_pf: Optional[float]=None
+    readiness_min_shadow_hours: Optional[float]=None
+    readiness_max_drawdown_pct: Optional[float]=None
+    readiness_max_mc_below_start_pct: Optional[float]=None
+    readiness_min_wf_robust: Optional[int]=None
+    readiness_max_exec_bps: Optional[float]=None
     min_liquidity: Optional[float]=None
     min_market_risk: Optional[float]=None
     execution_cost_pct: Optional[float]=None
@@ -1586,13 +2291,16 @@ class WatchIn(BaseModel):
 
 @app.get("/")
 def root():
-    return {"name":"NOVA Trader Cloud","version":APP_VERSION,"mode":"V4.5 PORTFOLIO BRAIN + CORRELATION GUARD / PAPER ONLY","docs":"/docs"}
+    return {"name":"NOVA Trader Ultimate","version":APP_VERSION,
+            "operating_mode":operating_mode(),"live_execution_locked":LIVE_EXECUTION_LOCKED,
+            "mode":"PAPER + SHADOW / LIVE HARD-LOCKED","docs":"/docs"}
 
 @app.get("/health")
 def health():
-    return {"ok":True,"loop_alive":runtime["loop_alive"],"last_refresh":runtime["last_refresh"],
-            "velocity_source_ok":runtime["velocity_source_ok"],"last_velocity_refresh":runtime["last_velocity_refresh"],
-            "error":runtime["last_error"]}
+    h=source_health()
+    return {"ok":h["status"]!="CRITICAL","version":APP_VERSION,"system":h,
+            "operating_mode":operating_mode(),"live_execution_locked":LIVE_EXECUTION_LOCKED,
+            "last_refresh":runtime["last_refresh"],"last_error":runtime["last_error"]}
 
 @app.get("/api/dashboard")
 def dashboard():
@@ -1600,7 +2308,8 @@ def dashboard():
         trades=s.scalars(select(Trade).order_by(Trade.id.desc()).limit(50)).all()
     return {
         "version":APP_VERSION,
-        "mode":"PAPER",
+        "mode":operating_mode(),
+        "live_execution_locked":LIVE_EXECUTION_LOCKED,
         "bot_enabled":b("bot_enabled"),"killed":b("killed"),
         "pause_until":runtime["pause_until"].isoformat() if runtime["pause_until"] else None,
         "last_refresh":runtime["last_refresh"],"last_error":runtime["last_error"],
@@ -1611,6 +2320,12 @@ def dashboard():
         "adaptive":adaptive_status(),
         "research_status":snapshot_stats(),
         "portfolio":portfolio_status(),
+        "execution":execution_stats(),
+        "system_health":source_health(),
+        "security":token_security_status(),
+        "readiness":live_readiness(),
+        "decisions":recent_decisions(20),
+        "events":system_events(20),
         "positions":positions_with_marks(),
         "candidates":runtime["candidates"][:30],
         "trades":[{
@@ -1628,13 +2343,92 @@ def dashboard():
                 "replay_take_profit_pct","research_days","monte_carlo_runs",
                 "max_total_exposure_pct","max_strategy_exposure_pct","max_direction_exposure_pct",
                 "correlation_threshold","correlation_lookback_points","min_portfolio_weight",
+                "spot_fee_bps","perp_fee_bps","base_spread_bps","slippage_floor_bps",
+                "impact_coefficient_bps","simulated_latency_ms","max_execution_cost_bps",
+                "max_data_age_sec","min_token_security_score","security_scan_ttl_sec","security_scan_top_n",
+                "min_route_quality","spot_max_hold_minutes","perp_max_hold_minutes","reversal_exit_edge",
+                "breakeven_trigger_pct","breakeven_exit_pct","readiness_min_trades","readiness_min_pf",
+                "readiness_min_shadow_hours","readiness_max_drawdown_pct","readiness_max_mc_below_start_pct",
+                "readiness_min_wf_robust","readiness_max_exec_bps",
                 "min_liquidity","min_market_risk","execution_cost_pct","cooldown_minutes"
             ]},
             "block_extreme_volatility":b("block_extreme_volatility"),
             "adaptive_enabled":b("adaptive_enabled"),
-            "portfolio_brain_enabled":b("portfolio_brain_enabled")
+            "portfolio_brain_enabled":b("portfolio_brain_enabled"),
+            "execution_simulator_enabled":b("execution_simulator_enabled"),
+            "security_required_shadow":b("security_required_shadow"),
+            "security_hard_block_shadow":b("security_hard_block_shadow"),
+            "operating_mode":operating_mode()
         }
     }
+
+@app.get("/api/readiness")
+def readiness():
+    return live_readiness()
+
+@app.get("/api/system")
+def system_status():
+    return {"health":source_health(),"events":system_events(50),"mode":operating_mode(),
+            "live_execution_locked":LIVE_EXECUTION_LOCKED}
+
+@app.get("/api/security")
+def security():
+    return token_security_status()
+
+@app.post("/api/security/rescan/{mint}")
+async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
+    auth(x_nova_key)
+    c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
+    if not c:raise HTTPException(404,"Candidate not found")
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.0"}) as client:
+        result=await scan_token_security(client,c,force=True)
+    c["security"]=result
+    return {"mint":mint,"symbol":c.get("symbol"),"security":result}
+
+@app.get("/api/decisions")
+def decisions():
+    return recent_decisions(100)
+
+@app.get("/api/full-status")
+def full_status():
+    return {
+        "version":APP_VERSION,"mode":operating_mode(),"live_execution_locked":LIVE_EXECUTION_LOCKED,
+        "health":source_health(),"readiness":live_readiness(),"metrics":metrics(),
+        "adaptive":adaptive_status(),"portfolio":portfolio_status(),"execution":execution_stats(),
+        "research_status":snapshot_stats(),"security":token_security_status()
+    }
+
+@app.post("/api/mode/{mode}")
+def set_mode(mode:str, x_nova_key:Optional[str]=Header(None)):
+    auth(x_nova_key)
+    requested=mode.upper().strip()
+    if requested=="LIVE":
+        record_event("WARN","LIVE_BLOCKED","Attempt to select LIVE mode was blocked")
+        raise HTTPException(403,"LIVE execution is hard-locked in NOVA V5.0")
+    if requested not in ("PAPER","SHADOW"):
+        raise HTTPException(400,"Mode must be PAPER or SHADOW")
+    previous=operating_mode()
+    if requested=="SHADOW" and previous!="SHADOW":
+        setv("shadow_started_at",datetime.now(timezone.utc).isoformat())
+    setv("operating_mode",requested)
+    record_event("INFO","MODE_CHANGE",f"Operating mode changed {previous} -> {requested}")
+    return {"ok":True,"mode":requested,"live_execution_locked":LIVE_EXECUTION_LOCKED}
+
+@app.get("/api/execution")
+def execution():
+    return execution_stats()
+
+@app.post("/api/execution/estimate")
+def execution_estimate(data:WatchIn, x_nova_key:Optional[str]=Header(None)):
+    auth(x_nova_key)
+    c=next((x for x in runtime["candidates"] if x.get("mint")==data.mint),None)
+    if not c:raise HTTPException(404,"Candidate not found")
+    strategy="PERP_SHORT" if c.get("perp_eligible") and c.get("direction")=="SHORT" else (
+        "PERP_LONG" if c.get("perp_eligible") else "SCALP_LONG"
+    )
+    notional=max(10.0,planned_collateral(c,strategy)*strategy_leverage(strategy))
+    return {"symbol":c.get("symbol"),"strategy":strategy,"notional_usd":notional,
+            "estimate":execution_cost_estimate(c,strategy,notional)}
 
 @app.get("/api/portfolio")
 def portfolio():
@@ -1658,23 +2452,38 @@ def control(action:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     if action=="start":
         setv("killed","false");setv("bot_enabled","true")
+        record_event("INFO","BOT_START","Auto Trader started",{"mode":operating_mode()},dedupe_sec=5)
     elif action=="stop":
         setv("bot_enabled","false")
+        record_event("INFO","BOT_STOP","Auto Trader stopped",{},dedupe_sec=5)
     elif action=="kill":
         setv("bot_enabled","false");setv("killed","true")
+        record_event("WARN","KILL_SWITCH","Kill switch activated",{},dedupe_sec=5)
     elif action=="reset-paper":
         with SessionLocal() as s:
-            s.query(PositionFeature).delete();s.query(TradeFeature).delete();s.query(Position).delete();s.query(Trade).delete();s.query(EquityPoint).delete();s.commit()
+            s.query(PositionFeature).delete();s.query(TradeFeature).delete();s.query(ExecutionEvent).delete();s.query(Position).delete();s.query(Trade).delete();s.query(EquityPoint).delete();s.commit()
         setv("cash",getv("start_balance"));setv("bot_enabled","false");setv("killed","false")
-        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["pause_until"]=None
+        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["pause_until"]=None
     else: raise HTTPException(400,"Unknown action")
     return {"ok":True,"action":action}
 
 @app.post("/api/settings")
 def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
-    for k,v in data.model_dump(exclude_none=True).items():setv(k,v)
-    return {"ok":True}
+    vals=data.model_dump(exclude_none=True)
+    if "risk_pct" in vals and not (0.05<=vals["risk_pct"]<=2.0):
+        raise HTTPException(400,"risk_pct must be between 0.05 and 2.0")
+    if "perp_leverage" in vals and not (1.0<=vals["perp_leverage"]<=2.0):
+        raise HTTPException(400,"perp_leverage must be between 1x and 2x")
+    if "max_positions" in vals and not (1<=vals["max_positions"]<=10):
+        raise HTTPException(400,"max_positions must be 1..10")
+    if "stop_loss_pct" in vals and not (0.5<=vals["stop_loss_pct"]<=15):
+        raise HTTPException(400,"stop_loss_pct must be 0.5..15")
+    if "correlation_threshold" in vals and not (0.3<=vals["correlation_threshold"]<=0.99):
+        raise HTTPException(400,"correlation_threshold must be 0.30..0.99")
+    for k,v in vals.items():setv(k,v)
+    record_event("INFO","SETTINGS_UPDATE","Risk/strategy settings updated",{"keys":list(vals.keys())},dedupe_sec=5)
+    return {"ok":True,"updated":list(vals.keys())}
 
 @app.post("/api/watch")
 def watch(data:WatchIn, x_nova_key:Optional[str]=Header(None)):
@@ -1685,3 +2494,11 @@ def watch(data:WatchIn, x_nova_key:Optional[str]=Header(None)):
     if mint not in vals:vals.append(mint)
     setv("watchlist",",".join(vals[-30:]))
     return {"ok":True}
+
+@app.post("/api/watch/remove")
+def watch_remove(data:WatchIn, x_nova_key:Optional[str]=Header(None)):
+    auth(x_nova_key)
+    mint=data.mint.strip()
+    vals=[x for x in getv("watchlist","").split(",") if x and x!=mint]
+    setv("watchlist",",".join(vals))
+    return {"ok":True,"removed":mint}
