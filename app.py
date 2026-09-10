@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "5.3.0"
+APP_VERSION = "5.4.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -238,6 +238,14 @@ DEFAULTS = {
     "breakeven_trigger_pct": "6",
     "breakeven_exit_pct": "0.5",
     "profit_lock_enabled": "true",
+    "capital_shield_enabled": "true",
+    "scalp_max_loss_pct": "1.75",
+    "pump_max_loss_pct": "2.75",
+    "perp_max_loss_pct": "1.50",
+    "scratch_after_minutes": "8",
+    "scratch_loss_pct": "0.75",
+    "scratch_min_peak_pct": "0.50",
+    "global_equity_guard_pct": "2.50",
     "position_watch_interval_sec": "8",
     "stale_position_price_sec": "45",
     "readiness_min_trades": "100",
@@ -1945,6 +1953,8 @@ def gate(c,strategy=None):
     start_balance=f("start_balance")
     if today_realized() <= -(start_balance*f("daily_loss_limit_pct")/100):
         return False,"daily loss limit"
+    if b("capital_shield_enabled") and global_equity_guard_status()["blocked"]:
+        return False,"global equity guard"
 
     if strategy:
         rok,rreason,rdetail=route_gate(c,strategy)
@@ -2093,6 +2103,46 @@ def close_position(p,c,reason):
         runtime["pause_until"]=datetime.now(timezone.utc)+timedelta(minutes=i("loss_pause_minutes"))
 
 
+
+def strategy_max_loss_pct(strategy):
+    if not b("capital_shield_enabled"):
+        return f("stop_loss_pct")
+    hard=f("stop_loss_pct")
+    if strategy=="SCALP_LONG":
+        return min(hard,f("scalp_max_loss_pct"))
+    if strategy=="PUMP_LONG":
+        return min(hard,f("pump_max_loss_pct"))
+    if strategy in ("PERP_LONG","PERP_SHORT"):
+        return min(hard,f("perp_max_loss_pct"))
+    return hard
+
+def strategy_breakeven_rule(strategy):
+    # Net-return thresholds, after simulated execution friction.
+    if strategy=="SCALP_LONG":
+        return 0.90,0.05
+    if strategy=="PUMP_LONG":
+        return 1.50,0.10
+    if strategy in ("PERP_LONG","PERP_SHORT"):
+        return 0.80,0.05
+    return 1.50,0.05
+
+def global_open_pnl():
+    positions=positions_with_marks()
+    return sum(nz(p.get("market_value"))-nz(p.get("remaining_cost"))+nz(p.get("locked_pnl")) for p in positions)
+
+def global_equity_guard_status():
+    realized=today_realized()
+    open_pnl=global_open_pnl()
+    combined=realized+open_pnl
+    limit=-(f("start_balance")*f("global_equity_guard_pct")/100)
+    return {
+        "realized_today":realized,
+        "open_pnl":open_pnl,
+        "combined_pnl":combined,
+        "limit_usd":limit,
+        "blocked":combined<=limit
+    }
+
 def expected_exit_total_pct(p,c):
     """Estimated total P&L % if the remaining position were closed now, after simulated exit friction."""
     side=strategy_side(p.strategy)
@@ -2121,6 +2171,7 @@ def strategy_profit_lock(strategy,peak_net_pct):
         if p>=5:return 2.5
         if p>=3:return 1.25
         if p>=1.5:return 0.35
+        if p>=1.0:return 0.15
     elif strategy=="PUMP_LONG":
         if p>=30:return max(14.0,p-9.0)
         if p>=20:return 9.0
@@ -2128,12 +2179,14 @@ def strategy_profit_lock(strategy,peak_net_pct):
         if p>=8:return 3.0
         if p>=4:return 1.25
         if p>=2:return 0.50
+        if p>=1.5:return 0.20
     elif strategy in ("PERP_LONG","PERP_SHORT"):
         if p>=12:return max(6.0,p-4.0)
         if p>=8:return 4.0
         if p>=5:return 2.0
         if p>=3:return 1.0
         if p>=1.5:return 0.30
+        if p>=1.0:return 0.15
     return None
 
 def strategy_tp_plan(strategy):
@@ -2151,6 +2204,13 @@ def manage_positions():
     with SessionLocal() as s:
         pos=s.scalars(select(Position)).all()
         for p in pos:s.expunge(p)
+
+    # Account-level emergency guard. It uses realized + current open P&L.
+    guard=global_equity_guard_status()
+    flatten_all=b("capital_shield_enabled") and guard["blocked"] and bool(pos)
+    if flatten_all:
+        record_event("WARN","GLOBAL_EQUITY_GUARD","Global equity guard triggered",
+                     {"combined_pnl":guard["combined_pnl"],"limit_usd":guard["limit_usd"]},dedupe_sec=60)
 
     for p in pos:
         c=cands.get(p.mint)
@@ -2173,14 +2233,8 @@ def manage_positions():
             else:
                 obj.peak_price=max(obj.peak_price,c["price"])
 
-            # Gross mark is useful for momentum/trailing geometry.
-            gross_ret=directional_return_pct(obj,c["price"])
-
-            # Net exit return includes the simulated friction of actually closing now.
             net_ret=expected_exit_total_pct(obj,c)
-
-            peak_c=dict(c)
-            peak_c["price"]=obj.peak_price
+            peak_c=dict(c);peak_c["price"]=obj.peak_price
             peak_net_ret=expected_exit_total_pct(obj,peak_c)
             pull_net=net_ret-peak_net_ret
 
@@ -2190,13 +2244,28 @@ def manage_positions():
             max_hold=f("perp_max_hold_minutes") if str(obj.strategy).startswith("PERP_") else f("spot_max_hold_minutes")
             reason=None
 
-            # 1) Hard risk stop uses estimated net liquidation value.
-            if net_ret<=-f("stop_loss_pct"):
-                reason="STOP_LOSS"
+            if flatten_all:
+                reason="GLOBAL_EQUITY_GUARD"
 
-            # 2) Strategy-specific Profit Lock: once meaningful profit has existed,
-            # do not allow the remaining position to round-trip back into a loss.
-            elif b("profit_lock_enabled"):
+            # Strategy-specific hard stop is intentionally tighter than the user-visible
+            # absolute stop-loss cap.
+            elif net_ret<=-strategy_max_loss_pct(obj.strategy):
+                reason="CAPITAL_SHIELD_STOP"
+
+            # Scratch trades that fail to follow through. This cuts small losers before
+            # they grow into full stops, but only after enough time has passed.
+            elif b("capital_shield_enabled") and held_minutes>=f("scratch_after_minutes") and \
+                 peak_net_ret<f("scratch_min_peak_pct") and net_ret<=-f("scratch_loss_pct"):
+                reason="SCRATCH_EXIT"
+
+            # Early break-even protection after modest net profit.
+            elif b("capital_shield_enabled"):
+                be_trigger,be_floor=strategy_breakeven_rule(obj.strategy)
+                if peak_net_ret>=be_trigger and net_ret<=be_floor:
+                    reason="EARLY_BREAK_EVEN"
+
+            # Strategy-specific Profit Lock.
+            if reason is None and b("profit_lock_enabled"):
                 floor=strategy_profit_lock(obj.strategy,peak_net_ret)
                 if floor is not None and net_ret<=floor:
                     reason="PROFIT_LOCK"
@@ -2221,7 +2290,6 @@ def manage_positions():
                 if net_ret>=tp3[0] and not obj.tp3:
                     partial_sell(obj,c,tp3[1]);obj.tp3=True
 
-                # Wide trailing still lets large winners run after profit has already been protected.
                 trail=None
                 if peak_net_ret>=60:trail=-14
                 elif peak_net_ret>=35:trail=-11
@@ -2315,7 +2383,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.3"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.4"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -2457,6 +2525,14 @@ class SettingsIn(BaseModel):
     breakeven_trigger_pct: Optional[float]=None
     breakeven_exit_pct: Optional[float]=None
     profit_lock_enabled: Optional[bool]=None
+    capital_shield_enabled: Optional[bool]=None
+    scalp_max_loss_pct: Optional[float]=None
+    pump_max_loss_pct: Optional[float]=None
+    perp_max_loss_pct: Optional[float]=None
+    scratch_after_minutes: Optional[float]=None
+    scratch_loss_pct: Optional[float]=None
+    scratch_min_peak_pct: Optional[float]=None
+    global_equity_guard_pct: Optional[float]=None
     position_watch_interval_sec: Optional[int]=None
     stale_position_price_sec: Optional[int]=None
     readiness_min_trades: Optional[int]=None
@@ -2501,7 +2577,7 @@ def dashboard():
         "last_refresh":runtime["last_refresh"],"last_error":runtime["last_error"],
         "velocity_source_ok":runtime["velocity_source_ok"],
         "last_velocity_refresh":runtime["last_velocity_refresh"],
-        "metrics":{**metrics(),**today_guard_status()},
+        "metrics":{**metrics(),**today_guard_status(),"equity_guard":global_equity_guard_status()},
         "equity_curve":equity_curve(120),
         "adaptive":adaptive_status(),
         "research_status":snapshot_stats(),
@@ -2536,6 +2612,8 @@ def dashboard():
                 "breakeven_trigger_pct","breakeven_exit_pct","position_watch_interval_sec","stale_position_price_sec","readiness_min_trades","readiness_min_pf",
                 "readiness_min_shadow_hours","readiness_max_drawdown_pct","readiness_max_mc_below_start_pct",
                 "readiness_min_wf_robust","readiness_max_exec_bps",
+                "scalp_max_loss_pct","pump_max_loss_pct","perp_max_loss_pct","scratch_after_minutes",
+                "scratch_loss_pct","scratch_min_peak_pct","global_equity_guard_pct",
                 "min_liquidity","min_market_risk","min_spot_market_quality","execution_cost_pct","cooldown_minutes"
             ]},
             "block_extreme_volatility":b("block_extreme_volatility"),
@@ -2545,6 +2623,7 @@ def dashboard():
             "security_required_shadow":b("security_required_shadow"),
             "security_hard_block_shadow":b("security_hard_block_shadow"),
             "profit_lock_enabled":b("profit_lock_enabled"),
+            "capital_shield_enabled":b("capital_shield_enabled"),
             "operating_mode":operating_mode()
         }
     }
@@ -2567,7 +2646,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.3"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.4"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
