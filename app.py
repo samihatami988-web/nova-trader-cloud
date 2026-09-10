@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "5.4.0"
+APP_VERSION = "5.5.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -246,7 +246,11 @@ DEFAULTS = {
     "scratch_loss_pct": "0.75",
     "scratch_min_peak_pct": "0.50",
     "global_equity_guard_pct": "2.50",
-    "position_watch_interval_sec": "8",
+    "capital_shield_min_liquidity": "50000",
+    "capital_shield_min_market_quality": "65",
+    "max_spot_position_liquidity_pct": "0.75",
+    "max_spot_abs_m5_pct": "25",
+    "position_watch_interval_sec": "4",
     "stale_position_price_sec": "45",
     "readiness_min_trades": "100",
     "readiness_min_pf": "1.15",
@@ -319,6 +323,8 @@ runtime = {
     "last_perp_refresh": None,
     "last_successful_loop": None,
     "last_position_watch": 0,
+    "position_watcher_alive": False,
+    "position_watch_error": None,
     "position_price_seen": {},
     "engine_error_streak": 0,
     "last_decision_log": {},
@@ -329,6 +335,8 @@ runtime = {
     "pause_until": None,
     "loop_alive": False,
 }
+
+position_manage_lock = asyncio.Lock()
 
 def auth(x_nova_key: Optional[str]):
     if not x_nova_key or x_nova_key != ADMIN_KEY:
@@ -1921,11 +1929,20 @@ def gate(c,strategy=None):
         if operating_mode()=="SHADOW" and c.get("data_source")!="VELOCITY":
             return False,"shadow requires primary perp source"
     else:
-        # SPOT gate = liquidity + spot market quality + on-chain security.
-        if c.get("liquidity",0) < f("min_liquidity"):
+        # SPOT gate = liquidity + quality + security.
+        # Capital Shield applies stricter floors than older persisted dashboard settings.
+        min_liq=f("min_liquidity")
+        min_quality=f("min_spot_market_quality")
+        if b("capital_shield_enabled"):
+            min_liq=max(min_liq,f("capital_shield_min_liquidity"))
+            min_quality=max(min_quality,f("capital_shield_min_market_quality"))
+
+        if c.get("liquidity",0) < min_liq:
             return False,"low spot liquidity"
-        if c.get("market_risk",0) < f("min_spot_market_quality"):
+        if c.get("market_risk",0) < min_quality:
             return False,"low spot market quality"
+        if b("capital_shield_enabled") and abs(nz(c.get("m5"))) >= f("max_spot_abs_m5_pct"):
+            return False,"spot move too extreme"
 
         sec=c.get("security") or {}
         sec_status=sec.get("status","UNKNOWN")
@@ -1977,6 +1994,10 @@ def open_position(c,strategy):
     if not ok:return False,reason
     leverage=max(1.0,min(2.0,strategy_leverage(strategy)))
     collateral=planned_collateral(c,strategy)
+    if not c.get("perp_eligible") and b("capital_shield_enabled"):
+        liq=max(0,nz(c.get("liquidity")))
+        liq_cap=liq*f("max_spot_position_liquidity_pct")/100
+        collateral=min(collateral,liq_cap)
     if collateral<5:return False,"position too small"
 
     execution_notional=collateral*leverage
@@ -2274,8 +2295,12 @@ def manage_positions():
                 reason="TIME_STOP"
             elif reason is None and str(obj.strategy).startswith("PERP_") and c.get("direction") in ("LONG","SHORT") and c.get("direction")!=side and nz(c.get("direction_edge"))>=f("reversal_exit_edge"):
                 reason="SIGNAL_REVERSAL"
-            elif reason is None and not str(obj.strategy).startswith("PERP_") and prevliq>0 and c["liquidity"]<prevliq*.65:
-                reason="LIQUIDITY_DROP"
+            elif reason is None and not str(obj.strategy).startswith("PERP_"):
+                shield_min_liq=max(f("min_liquidity"),f("capital_shield_min_liquidity")) if b("capital_shield_enabled") else f("min_liquidity")
+                if c.get("liquidity",0)<shield_min_liq*.70:
+                    reason="LIQUIDITY_EMERGENCY"
+                elif prevliq>0 and c.get("liquidity",0)<prevliq*(.80 if b("capital_shield_enabled") else .65):
+                    reason="LIQUIDITY_DROP"
             elif reason is None and side=="LONG" and c["buy_pressure"]<24 and net_ret>0:
                 reason="MOMENTUM_EXIT"
             elif reason is None and side=="SHORT" and c["buy_pressure"]>76 and net_ret>0:
@@ -2370,6 +2395,64 @@ async def fetch_open_spot_pairs(client,boosts):
         c["position_watch"]=True
     return rows
 
+
+async def manage_positions_safe():
+    async with position_manage_lock:
+        manage_positions()
+
+def merge_position_updates(updates):
+    if not updates:return
+    current={x["mint"]:x for x in runtime.get("candidates",[])}
+    for fresh in updates:
+        old=current.get(fresh["mint"],{})
+        # Preserve expensive metadata/security from the main scanner while
+        # replacing fresh price/liquidity/transaction fields.
+        merged={**old,**fresh}
+        if old.get("security") and not fresh.get("security"):
+            merged["security"]=old["security"]
+        current[fresh["mint"]]=merged
+    runtime["candidates"]=list(current.values())
+
+async def position_watch_loop():
+    runtime["position_watcher_alive"]=True
+    record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
+                 {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/5.5"}) as client:
+        while True:
+            try:
+                with SessionLocal() as s:
+                    positions=s.scalars(select(Position)).all()
+                    for p in positions:s.expunge(p)
+
+                if positions:
+                    updates=[]
+                    spot_mints=[p.mint for p in positions if not str(p.strategy).startswith("PERP_")]
+                    if spot_mints:
+                        fresh_spot=await fetch_pairs(client,list(dict.fromkeys(spot_mints)),{})
+                        for c in fresh_spot:
+                            c["position_watch"]=True
+                            runtime["position_price_seen"][c["mint"]]=time.time()
+                        updates.extend(fresh_spot)
+
+                    if any(str(p.strategy).startswith("PERP_") for p in positions):
+                        raw=await fetch_velocity_markets(client)
+                        if raw:
+                            perps=[perp_intelligence(v) for v in raw]
+                            open_mints={p.mint for p in positions if str(p.strategy).startswith("PERP_")}
+                            updates.extend([c for c in perps if c["mint"] in open_mints])
+
+                    merge_position_updates(updates)
+                    runtime["last_position_watch"]=time.time()
+                    runtime["position_watch_error"]=None
+                    await manage_positions_safe()
+
+                runtime["position_watcher_alive"]=True
+            except Exception as e:
+                runtime["position_watch_error"]=str(e)
+                record_event("ERROR","FAST_WATCH_ERROR",str(e)[:220],{},dedupe_sec=120)
+
+            await asyncio.sleep(max(3,min(30,i("position_watch_interval_sec"))))
+
 def today_guard_status():
     realized=today_realized()
     limit=-(f("start_balance")*f("daily_loss_limit_pct")/100)
@@ -2383,7 +2466,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.4"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.5"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -2444,7 +2527,7 @@ async def engine_loop():
                     runtime["last_refresh"]=now_iso
                     runtime["last_successful_loop"]=now_iso
                     runtime["engine_error_streak"]=0
-                    manage_positions()
+                    await manage_positions_safe()
                     choose_entry()
                     record_equity_snapshot()
                     record_market_snapshots(pairs)
@@ -2468,6 +2551,7 @@ async def engine_loop():
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(engine_loop())
+    asyncio.create_task(position_watch_loop())
 
 class SettingsIn(BaseModel):
     risk_pct: Optional[float]=None
@@ -2533,6 +2617,10 @@ class SettingsIn(BaseModel):
     scratch_loss_pct: Optional[float]=None
     scratch_min_peak_pct: Optional[float]=None
     global_equity_guard_pct: Optional[float]=None
+    capital_shield_min_liquidity: Optional[float]=None
+    capital_shield_min_market_quality: Optional[float]=None
+    max_spot_position_liquidity_pct: Optional[float]=None
+    max_spot_abs_m5_pct: Optional[float]=None
     position_watch_interval_sec: Optional[int]=None
     stale_position_price_sec: Optional[int]=None
     readiness_min_trades: Optional[int]=None
@@ -2578,6 +2666,12 @@ def dashboard():
         "velocity_source_ok":runtime["velocity_source_ok"],
         "last_velocity_refresh":runtime["last_velocity_refresh"],
         "metrics":{**metrics(),**today_guard_status(),"equity_guard":global_equity_guard_status()},
+        "fast_watcher":{
+            "alive":runtime["position_watcher_alive"],
+            "interval_sec":i("position_watch_interval_sec"),
+            "last_watch_age_sec":round(time.time()-runtime["last_position_watch"],1) if runtime["last_position_watch"] else None,
+            "error":runtime["position_watch_error"]
+        },
         "equity_curve":equity_curve(120),
         "adaptive":adaptive_status(),
         "research_status":snapshot_stats(),
@@ -2614,6 +2708,8 @@ def dashboard():
                 "readiness_min_wf_robust","readiness_max_exec_bps",
                 "scalp_max_loss_pct","pump_max_loss_pct","perp_max_loss_pct","scratch_after_minutes",
                 "scratch_loss_pct","scratch_min_peak_pct","global_equity_guard_pct",
+                "capital_shield_min_liquidity","capital_shield_min_market_quality",
+                "max_spot_position_liquidity_pct","max_spot_abs_m5_pct",
                 "min_liquidity","min_market_risk","min_spot_market_quality","execution_cost_pct","cooldown_minutes"
             ]},
             "block_extreme_volatility":b("block_extreme_volatility"),
@@ -2646,7 +2742,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.4"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.5"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
@@ -2748,8 +2844,8 @@ def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
         raise HTTPException(400,"stop_loss_pct must be 0.5..15")
     if "correlation_threshold" in vals and not (0.3<=vals["correlation_threshold"]<=0.99):
         raise HTTPException(400,"correlation_threshold must be 0.30..0.99")
-    if "position_watch_interval_sec" in vals and not (5<=vals["position_watch_interval_sec"]<=30):
-        raise HTTPException(400,"position_watch_interval_sec must be 5..30")
+    if "position_watch_interval_sec" in vals and not (3<=vals["position_watch_interval_sec"]<=30):
+        raise HTTPException(400,"position_watch_interval_sec must be 3..30")
     if "stale_position_price_sec" in vals and not (15<=vals["stale_position_price_sec"]<=180):
         raise HTTPException(400,"stale_position_price_sec must be 15..180")
     for k,v in vals.items():setv(k,v)
