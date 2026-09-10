@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "5.5.0"
+APP_VERSION = "5.6.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -250,6 +250,22 @@ DEFAULTS = {
     "capital_shield_min_market_quality": "65",
     "max_spot_position_liquidity_pct": "0.75",
     "max_spot_abs_m5_pct": "25",
+
+    "sniper_enabled": "true",
+    "min_sniper_score": "78",
+    "sniper_scan_interval_sec": "8",
+    "sniper_min_buy_pressure": "60",
+    "sniper_min_volume_accel": "52",
+    "sniper_min_m5_pct": "0.30",
+    "sniper_max_m5_pct": "12",
+    "sniper_max_age_minutes": "360",
+    "sniper_max_positions": "1",
+    "sniper_risk_multiplier": "0.50",
+    "sniper_max_loss_pct": "1.00",
+    "sniper_scratch_minutes": "1.50",
+    "sniper_scratch_loss_pct": "0.35",
+    "sniper_max_hold_minutes": "5",
+
     "position_watch_interval_sec": "4",
     "stale_position_price_sec": "45",
     "readiness_min_trades": "100",
@@ -326,6 +342,12 @@ runtime = {
     "position_watcher_alive": False,
     "position_watch_error": None,
     "position_price_seen": {},
+
+    "sniper_scanner_alive": False,
+    "last_sniper_scan": 0,
+    "sniper_scan_error": None,
+    "sniper_entries": 0,
+    "sniper_candidates": [],
     "engine_error_streak": 0,
     "last_decision_log": {},
     "last_event_log": {},
@@ -337,6 +359,7 @@ runtime = {
 }
 
 position_manage_lock = asyncio.Lock()
+entry_lock = asyncio.Lock()
 
 def auth(x_nova_key: Optional[str]):
     if not x_nova_key or x_nova_key != ADMIN_KEY:
@@ -739,6 +762,38 @@ def score_pair(p, source_boost=0):
     ratio_score = max(0, min(100, ratio * 700))
 
     boost = min(100, source_boost)
+
+    # Sniper score: early acceleration without chasing an already vertical move.
+    if 0.30 <= m5 <= 6:
+        sniper_momentum = 100
+    elif 6 < m5 <= 10:
+        sniper_momentum = 82
+    elif 10 < m5 <= 12:
+        sniper_momentum = 65
+    elif 0 < m5 < 0.30:
+        sniper_momentum = 45
+    else:
+        sniper_momentum = 10
+
+    if age_min <= 30:
+        sniper_age = 100
+    elif age_min <= 120:
+        sniper_age = 90
+    elif age_min <= 360:
+        sniper_age = 70
+    elif age_min <= 1440:
+        sniper_age = 35
+    else:
+        sniper_age = 10
+
+    tx_activity = clamp(25 + 18 * math.log10(max(total5,1)),0,100)
+
+    sniper = round(
+        pressure*.21 + vol_accel*.24 + sniper_momentum*.18 +
+        liquidity_score*.14 + tx_activity*.10 + ratio_score*.07 +
+        sniper_age*.04 + boost*.02
+    )
+
     pump = round(
         vol_accel * .22 + pressure * .22 + bull_momentum * .20 +
         liquidity_score * .14 + ratio_score * .12 + age_score * .07 + boost * .03
@@ -764,6 +819,7 @@ def score_pair(p, source_boost=0):
         max(0,min(100, 70 - abs(m5)*1.4))*.20
     )
     return {
+        "sniper_score": max(0,min(100,sniper)),
         "pump_score": max(0,min(100,pump)),
         "scalp_score": max(0,min(100,scalp)),
         "long_score": max(0,min(100,long_score)),
@@ -1262,7 +1318,7 @@ def monte_carlo():
 
 def research_report():
     rows=load_research_snapshots()
-    strategies=["PUMP_LONG","SCALP_LONG","PERP_LONG","PERP_SHORT"]
+    strategies=["SNIPER_LONG","PUMP_LONG","SCALP_LONG","PERP_LONG","PERP_SHORT"]
     replays={}
     walks={}
     for s in strategies:
@@ -1282,6 +1338,8 @@ def research_report():
 def suggested_strategy(c):
     if c.get("perp_eligible"):
         return "PERP_SHORT" if c.get("direction")=="SHORT" else "PERP_LONG"
+    if b("sniper_enabled") and nz(c.get("sniper_score")) >= f("min_sniper_score"):
+        return "SNIPER_LONG"
     return "PUMP_LONG" if nz(c.get("pump_score"))>=nz(c.get("scalp_score")) else "SCALP_LONG"
 
 def route_quality(c,strategy,notional_usd=None):
@@ -1545,8 +1603,10 @@ def planned_collateral(c,strategy):
     leverage=max(1.0,min(2.0,strategy_leverage(strategy)))
     rm=risk_multiplier()
     pw=portfolio_weight(strategy)
-    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw
-    collateral=risk_budget/max((f("stop_loss_pct")/100)*leverage,0.001)
+    strategy_risk_mult=f("sniper_risk_multiplier") if strategy=="SNIPER_LONG" else 1.0
+    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult
+    effective_stop=strategy_max_loss_pct(strategy) if strategy=="SNIPER_LONG" else f("stop_loss_pct")
+    collateral=risk_budget/max((effective_stop/100)*leverage,0.001)
     collateral=min(collateral,m["equity"]*f("max_position_pct")/100,f("cash"))
     return max(0.0,collateral)
 
@@ -1611,11 +1671,11 @@ def strategy_regime_weight(strategy, regime=None):
     regime=regime or market_regime()
     name=regime.get("name","CHOP")
     table={
-        "RISK_ON":{"PUMP_LONG":1.00,"SCALP_LONG":0.95,"PERP_LONG":1.00,"PERP_SHORT":0.50},
-        "RISK_OFF":{"PUMP_LONG":0.45,"SCALP_LONG":0.65,"PERP_LONG":0.50,"PERP_SHORT":1.00},
-        "CHOP":{"PUMP_LONG":0.60,"SCALP_LONG":1.00,"PERP_LONG":0.72,"PERP_SHORT":0.72},
-        "HIGH_VOL":{"PUMP_LONG":0.35,"SCALP_LONG":0.50,"PERP_LONG":0.55,"PERP_SHORT":0.55},
-        "WARMUP":{"PUMP_LONG":0.70,"SCALP_LONG":0.70,"PERP_LONG":0.70,"PERP_SHORT":0.70},
+        "RISK_ON":{"SNIPER_LONG":0.90,"PUMP_LONG":1.00,"SCALP_LONG":0.95,"PERP_LONG":1.00,"PERP_SHORT":0.50},
+        "RISK_OFF":{"SNIPER_LONG":0.45,"PUMP_LONG":0.45,"SCALP_LONG":0.65,"PERP_LONG":0.50,"PERP_SHORT":1.00},
+        "CHOP":{"SNIPER_LONG":0.70,"PUMP_LONG":0.60,"SCALP_LONG":1.00,"PERP_LONG":0.72,"PERP_SHORT":0.72},
+        "HIGH_VOL":{"SNIPER_LONG":0.35,"PUMP_LONG":0.35,"SCALP_LONG":0.50,"PERP_LONG":0.55,"PERP_SHORT":0.55},
+        "WARMUP":{"SNIPER_LONG":0.65,"PUMP_LONG":0.70,"SCALP_LONG":0.70,"PERP_LONG":0.70,"PERP_SHORT":0.70},
     }
     return table.get(name,table["CHOP"]).get(strategy,0.60)
 
@@ -1749,7 +1809,7 @@ def portfolio_gate(c,strategy):
 def portfolio_status():
     regime=market_regime()
     exp=portfolio_exposure()
-    strategies=["PUMP_LONG","SCALP_LONG","PERP_LONG","PERP_SHORT"]
+    strategies=["SNIPER_LONG","PUMP_LONG","SCALP_LONG","PERP_LONG","PERP_SHORT"]
     return {
         "enabled":b("portfolio_brain_enabled"),
         "regime":regime,
@@ -1766,6 +1826,7 @@ def portfolio_status():
     }
 
 def strategy_entry_score(strategy,c):
+    if strategy=="SNIPER_LONG":return nz(c.get("sniper_score"))
     if strategy=="PUMP_LONG":return nz(c.get("pump_score"))
     if strategy=="SCALP_LONG":return nz(c.get("scalp_score"))
     if strategy=="PERP_LONG":return nz(c.get("long_score"))
@@ -1774,6 +1835,7 @@ def strategy_entry_score(strategy,c):
 
 def base_threshold(strategy):
     return {
+        "SNIPER_LONG":f("min_sniper_score"),
         "PUMP_LONG":f("min_pump_score"),
         "SCALP_LONG":f("min_scalp_score"),
         "PERP_LONG":f("min_long_score"),
@@ -1887,7 +1949,7 @@ def risk_multiplier():
     return round(mult,2)
 
 def adaptive_status():
-    strategies=["PUMP_LONG","SCALP_LONG","PERP_LONG","PERP_SHORT"]
+    strategies=["SNIPER_LONG","PUMP_LONG","SCALP_LONG","PERP_LONG","PERP_SHORT"]
     return {
         "enabled":b("adaptive_enabled"),
         "risk_multiplier":risk_multiplier(),
@@ -2129,6 +2191,8 @@ def strategy_max_loss_pct(strategy):
     if not b("capital_shield_enabled"):
         return f("stop_loss_pct")
     hard=f("stop_loss_pct")
+    if strategy=="SNIPER_LONG":
+        return min(hard,f("sniper_max_loss_pct"))
     if strategy=="SCALP_LONG":
         return min(hard,f("scalp_max_loss_pct"))
     if strategy=="PUMP_LONG":
@@ -2139,6 +2203,8 @@ def strategy_max_loss_pct(strategy):
 
 def strategy_breakeven_rule(strategy):
     # Net-return thresholds, after simulated execution friction.
+    if strategy=="SNIPER_LONG":
+        return 0.65,0.05
     if strategy=="SCALP_LONG":
         return 0.90,0.05
     if strategy=="PUMP_LONG":
@@ -2187,7 +2253,12 @@ def expected_exit_total_pct(p,c):
 def strategy_profit_lock(strategy,peak_net_pct):
     """Return minimum net P&L floor after a winner has reached a given peak."""
     p=nz(peak_net_pct)
-    if strategy=="SCALP_LONG":
+    if strategy=="SNIPER_LONG":
+        if p>=3.0:return max(2.0,p-0.9)
+        if p>=2.0:return 1.10
+        if p>=1.30:return 0.50
+        if p>=0.80:return 0.10
+    elif strategy=="SCALP_LONG":
         if p>=8:return max(4.0,p-2.5)
         if p>=5:return 2.5
         if p>=3:return 1.25
@@ -2212,6 +2283,8 @@ def strategy_profit_lock(strategy,peak_net_pct):
 
 def strategy_tp_plan(strategy):
     # Each tuple is: net-profit trigger %, fraction of original position to close.
+    if strategy=="SNIPER_LONG":
+        return [(1.0,.35),(1.8,.35),(3.0,.30)]
     if strategy=="SCALP_LONG":
         return [(2.0,.25),(3.5,.25),(5.0,.25)]
     if strategy=="PUMP_LONG":
@@ -2262,7 +2335,10 @@ def manage_positions():
             prevliq=runtime["prev_liq"].get(obj.mint,c.get("liquidity",0))
             opened=obj.opened_at if obj.opened_at.tzinfo else obj.opened_at.replace(tzinfo=timezone.utc)
             held_minutes=max(0,(datetime.now(timezone.utc)-opened).total_seconds()/60)
-            max_hold=f("perp_max_hold_minutes") if str(obj.strategy).startswith("PERP_") else f("spot_max_hold_minutes")
+            if obj.strategy=="SNIPER_LONG":
+                max_hold=f("sniper_max_hold_minutes")
+            else:
+                max_hold=f("perp_max_hold_minutes") if str(obj.strategy).startswith("PERP_") else f("spot_max_hold_minutes")
             reason=None
 
             if flatten_all:
@@ -2273,8 +2349,12 @@ def manage_positions():
             elif net_ret<=-strategy_max_loss_pct(obj.strategy):
                 reason="CAPITAL_SHIELD_STOP"
 
-            # Scratch trades that fail to follow through. This cuts small losers before
-            # they grow into full stops, but only after enough time has passed.
+            # Sniper scratch is much faster than ordinary strategies.
+            elif obj.strategy=="SNIPER_LONG" and held_minutes>=f("sniper_scratch_minutes") and \
+                 peak_net_ret<0.40 and net_ret<=-f("sniper_scratch_loss_pct"):
+                reason="SNIPER_SCRATCH_EXIT"
+
+            # Ordinary scratch trades that fail to follow through.
             elif b("capital_shield_enabled") and held_minutes>=f("scratch_after_minutes") and \
                  peak_net_ret<f("scratch_min_peak_pct") and net_ret<=-f("scratch_loss_pct"):
                 reason="SCRATCH_EXIT"
@@ -2301,6 +2381,9 @@ def manage_positions():
                     reason="LIQUIDITY_EMERGENCY"
                 elif prevliq>0 and c.get("liquidity",0)<prevliq*(.80 if b("capital_shield_enabled") else .65):
                     reason="LIQUIDITY_DROP"
+            elif reason is None and obj.strategy=="SNIPER_LONG" and held_minutes>=0.50 and \
+                 (nz(c.get("buy_pressure"))<50 or nz(c.get("m5"))<=-0.20):
+                reason="SNIPER_MOMENTUM_FADE"
             elif reason is None and side=="LONG" and c["buy_pressure"]<24 and net_ret>0:
                 reason="MOMENTUM_EXIT"
             elif reason is None and side=="SHORT" and c["buy_pressure"]>76 and net_ret>0:
@@ -2313,7 +2396,10 @@ def manage_positions():
                 if net_ret>=tp2[0] and not obj.tp2:
                     partial_sell(obj,c,tp2[1]);obj.tp2=True
                 if net_ret>=tp3[0] and not obj.tp3:
-                    partial_sell(obj,c,tp3[1]);obj.tp3=True
+                    if obj.strategy=="SNIPER_LONG":
+                        reason="SNIPER_TAKE_PROFIT"
+                    else:
+                        partial_sell(obj,c,tp3[1]);obj.tp3=True
 
                 trail=None
                 if peak_net_ret>=60:trail=-14
@@ -2328,6 +2414,67 @@ def manage_positions():
 
         if reason:
             close_position(obj,c,reason)
+
+
+def sniper_gate(c):
+    if not b("sniper_enabled"):
+        return False,"sniper disabled"
+    if c.get("perp_eligible"):
+        return False,"sniper spot only"
+    if nz(c.get("sniper_score")) < effective_threshold("SNIPER_LONG",c):
+        return False,"sniper score"
+    if nz(c.get("buy_pressure")) < f("sniper_min_buy_pressure"):
+        return False,"sniper buy pressure"
+    if nz(c.get("volume_accel")) < f("sniper_min_volume_accel"):
+        return False,"sniper volume acceleration"
+    m5=nz(c.get("m5"))
+    if m5 < f("sniper_min_m5_pct"):
+        return False,"sniper momentum too weak"
+    if m5 > f("sniper_max_m5_pct"):
+        return False,"sniper late chase"
+    if nz(c.get("age_minutes"),999999) > f("sniper_max_age_minutes"):
+        return False,"sniper market too old"
+
+    with SessionLocal() as s:
+        n=len(s.scalars(select(Position).where(Position.strategy=="SNIPER_LONG")).all())
+        if n>=i("sniper_max_positions"):
+            return False,"sniper max positions"
+
+    return gate(c,"SNIPER_LONG")
+
+async def choose_sniper_entry():
+    if not b("bot_enabled") or b("killed") or not b("sniper_enabled"):
+        return
+    async with entry_lock:
+        ranked=sorted(
+            runtime.get("sniper_candidates",[]),
+            key=lambda c:(nz(c.get("sniper_score")),nz(c.get("volume_accel")),nz(c.get("buy_pressure"))),
+            reverse=True
+        )
+        for c in ranked:
+            ok,reason=sniper_gate(c)
+            signal=nz(c.get("sniper_score"))
+            quality,route=signal_quality(c,"SNIPER_LONG",signal)
+            sec=c.get("security") or {}
+            sec_score=nz(sec.get("score"),50)
+
+            if not ok:
+                log_decision(c,"SNIPER_LONG","BLOCKED",reason,signal,quality,route.get("quality",0),sec_score)
+                continue
+
+            opened,oreason=open_position(c,"SNIPER_LONG")
+            if opened:
+                runtime["sniper_entries"]+=1
+                log_decision(c,"SNIPER_LONG","OPENED","sniper entry accepted",signal,quality,route.get("quality",0),sec_score)
+                record_event("INFO","SNIPER_ENTRY",f"{c.get('symbol')} SNIPER_LONG opened",
+                             {"score":signal,"quality":quality,"m5":c.get("m5"),
+                              "buy_pressure":c.get("buy_pressure"),"volume_accel":c.get("volume_accel")})
+                return
+            log_decision(c,"SNIPER_LONG","BLOCKED",oreason,signal,quality,route.get("quality",0),sec_score)
+
+async def choose_entry_safe():
+    async with entry_lock:
+        choose_entry()
 
 def choose_entry():
     if not b("bot_enabled") or b("killed"):return
@@ -2413,6 +2560,69 @@ def merge_position_updates(updates):
         current[fresh["mint"]]=merged
     runtime["candidates"]=list(current.values())
 
+
+async def sniper_scan_loop():
+    runtime["sniper_scanner_alive"]=True
+    record_event("INFO","SNIPER_START","Micro-Pump Sniper scanner started",
+                 {"interval_sec":i("sniper_scan_interval_sec")},dedupe_sec=5)
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/5.6"}) as client:
+        while True:
+            try:
+                if b("sniper_enabled"):
+                    addresses=[];boosts={}
+                    for ep,boosted in [
+                        ("/token-boosts/latest/v1",True),
+                        ("/token-profiles/latest/v1",False),
+                    ]:
+                        try:
+                            r=await client.get(DEX+ep,timeout=12)
+                            r.raise_for_status()
+                            data=r.json()
+                            if isinstance(data,dict):data=[data]
+                            for x in data or []:
+                                if x.get("chainId")!="solana" or not x.get("tokenAddress"):continue
+                                a=x["tokenAddress"];addresses.append(a)
+                                if boosted:
+                                    boosts[a]=max(boosts.get(a,0),nz(x.get("amount"))+nz(x.get("totalAmount"))*.15)
+                        except Exception:
+                            pass
+
+                    addresses=list(dict.fromkeys(addresses))[:45]
+                    rows=await fetch_pairs(client,addresses,boosts) if addresses else []
+
+                    # Pre-filter before RPC security calls.
+                    rows=[
+                        c for c in rows
+                        if not c.get("perp_eligible")
+                        and nz(c.get("sniper_score"))>=max(60,f("min_sniper_score")-8)
+                        and nz(c.get("buy_pressure"))>=max(50,f("sniper_min_buy_pressure")-8)
+                        and nz(c.get("volume_accel"))>=max(40,f("sniper_min_volume_accel")-10)
+                        and f("sniper_min_m5_pct")<=nz(c.get("m5"))<=f("sniper_max_m5_pct")
+                        and nz(c.get("age_minutes"),999999)<=f("sniper_max_age_minutes")
+                    ][:6]
+
+                    # Security scan only the strongest few sniper candidates.
+                    for c in rows[:3]:
+                        c["security"]=await scan_token_security(client,c)
+                    for c in rows[3:]:
+                        cached=runtime["token_security"].get(c["mint"])
+                        c["security"]={k:v for k,v in cached.items() if k!="_ts"} if cached else {
+                            "status":"UNKNOWN","score":None,"hard_block":False,
+                            "flags":["sniper security scan pending"],"source":"SOLANA_RPC"
+                        }
+
+                    runtime["sniper_candidates"]=rows
+                    merge_position_updates(rows)
+                    runtime["last_sniper_scan"]=time.time()
+                    runtime["sniper_scan_error"]=None
+                    runtime["sniper_scanner_alive"]=True
+                    await choose_sniper_entry()
+            except Exception as e:
+                runtime["sniper_scan_error"]=str(e)
+                record_event("ERROR","SNIPER_SCAN_ERROR",str(e)[:220],{},dedupe_sec=120)
+
+            await asyncio.sleep(max(5,min(30,i("sniper_scan_interval_sec"))))
+
 async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
@@ -2466,7 +2676,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.5"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.6"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -2528,7 +2738,7 @@ async def engine_loop():
                     runtime["last_successful_loop"]=now_iso
                     runtime["engine_error_streak"]=0
                     await manage_positions_safe()
-                    choose_entry()
+                    await choose_entry_safe()
                     record_equity_snapshot()
                     record_market_snapshots(pairs)
                     for c in pairs:runtime["prev_liq"][c["mint"]]=c.get("liquidity",0)
@@ -2552,6 +2762,7 @@ async def engine_loop():
 async def startup():
     asyncio.create_task(engine_loop())
     asyncio.create_task(position_watch_loop())
+    asyncio.create_task(sniper_scan_loop())
 
 class SettingsIn(BaseModel):
     risk_pct: Optional[float]=None
@@ -2621,6 +2832,22 @@ class SettingsIn(BaseModel):
     capital_shield_min_market_quality: Optional[float]=None
     max_spot_position_liquidity_pct: Optional[float]=None
     max_spot_abs_m5_pct: Optional[float]=None
+
+    sniper_enabled: Optional[bool]=None
+    min_sniper_score: Optional[float]=None
+    sniper_scan_interval_sec: Optional[int]=None
+    sniper_min_buy_pressure: Optional[float]=None
+    sniper_min_volume_accel: Optional[float]=None
+    sniper_min_m5_pct: Optional[float]=None
+    sniper_max_m5_pct: Optional[float]=None
+    sniper_max_age_minutes: Optional[float]=None
+    sniper_max_positions: Optional[int]=None
+    sniper_risk_multiplier: Optional[float]=None
+    sniper_max_loss_pct: Optional[float]=None
+    sniper_scratch_minutes: Optional[float]=None
+    sniper_scratch_loss_pct: Optional[float]=None
+    sniper_max_hold_minutes: Optional[float]=None
+
     position_watch_interval_sec: Optional[int]=None
     stale_position_price_sec: Optional[int]=None
     readiness_min_trades: Optional[int]=None
@@ -2666,6 +2893,20 @@ def dashboard():
         "velocity_source_ok":runtime["velocity_source_ok"],
         "last_velocity_refresh":runtime["last_velocity_refresh"],
         "metrics":{**metrics(),**today_guard_status(),"equity_guard":global_equity_guard_status()},
+        "sniper":{
+            "enabled":b("sniper_enabled"),
+            "alive":runtime["sniper_scanner_alive"],
+            "interval_sec":i("sniper_scan_interval_sec"),
+            "last_scan_age_sec":round(time.time()-runtime["last_sniper_scan"],1) if runtime["last_sniper_scan"] else None,
+            "entries":runtime["sniper_entries"],
+            "candidates":[{
+                "mint":c.get("mint"),"symbol":c.get("symbol"),
+                "sniper_score":c.get("sniper_score"),"m5":c.get("m5"),
+                "buy_pressure":c.get("buy_pressure"),"volume_accel":c.get("volume_accel"),
+                "liquidity":c.get("liquidity"),"age_minutes":c.get("age_minutes")
+            } for c in runtime.get("sniper_candidates",[])[:5]],
+            "error":runtime["sniper_scan_error"]
+        },
         "fast_watcher":{
             "alive":runtime["position_watcher_alive"],
             "interval_sec":i("position_watch_interval_sec"),
@@ -2710,6 +2951,11 @@ def dashboard():
                 "scratch_loss_pct","scratch_min_peak_pct","global_equity_guard_pct",
                 "capital_shield_min_liquidity","capital_shield_min_market_quality",
                 "max_spot_position_liquidity_pct","max_spot_abs_m5_pct",
+                "min_sniper_score","sniper_scan_interval_sec","sniper_min_buy_pressure",
+                "sniper_min_volume_accel","sniper_min_m5_pct","sniper_max_m5_pct",
+                "sniper_max_age_minutes","sniper_max_positions","sniper_risk_multiplier",
+                "sniper_max_loss_pct","sniper_scratch_minutes","sniper_scratch_loss_pct",
+                "sniper_max_hold_minutes",
                 "min_liquidity","min_market_risk","min_spot_market_quality","execution_cost_pct","cooldown_minutes"
             ]},
             "block_extreme_volatility":b("block_extreme_volatility"),
@@ -2720,6 +2966,7 @@ def dashboard():
             "security_hard_block_shadow":b("security_hard_block_shadow"),
             "profit_lock_enabled":b("profit_lock_enabled"),
             "capital_shield_enabled":b("capital_shield_enabled"),
+            "sniper_enabled":b("sniper_enabled"),
             "operating_mode":operating_mode()
         }
     }
@@ -2742,7 +2989,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.5"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.6"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
@@ -2825,7 +3072,7 @@ def control(action:str, x_nova_key:Optional[str]=Header(None)):
         with SessionLocal() as s:
             s.query(PositionFeature).delete();s.query(TradeFeature).delete();s.query(ExecutionEvent).delete();s.query(Position).delete();s.query(Trade).delete();s.query(EquityPoint).delete();s.commit()
         setv("cash",getv("start_balance"));setv("bot_enabled","false");setv("killed","false")
-        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["pause_until"]=None
+        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["sniper_entries"]=0;runtime["sniper_candidates"]=[];runtime["pause_until"]=None
         record_event("INFO","PAPER_RESET","Paper account reset to start balance",{"start_balance":f("start_balance")},dedupe_sec=5)
     else: raise HTTPException(400,"Unknown action")
     return {"ok":True,"action":action}
@@ -2844,6 +3091,12 @@ def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
         raise HTTPException(400,"stop_loss_pct must be 0.5..15")
     if "correlation_threshold" in vals and not (0.3<=vals["correlation_threshold"]<=0.99):
         raise HTTPException(400,"correlation_threshold must be 0.30..0.99")
+    if "sniper_scan_interval_sec" in vals and not (5<=vals["sniper_scan_interval_sec"]<=30):
+        raise HTTPException(400,"sniper_scan_interval_sec must be 5..30")
+    if "sniper_risk_multiplier" in vals and not (0.1<=vals["sniper_risk_multiplier"]<=1.0):
+        raise HTTPException(400,"sniper_risk_multiplier must be 0.1..1.0")
+    if "sniper_max_positions" in vals and not (1<=vals["sniper_max_positions"]<=2):
+        raise HTTPException(400,"sniper_max_positions must be 1..2")
     if "position_watch_interval_sec" in vals and not (3<=vals["position_watch_interval_sec"]<=30):
         raise HTTPException(400,"position_watch_interval_sec must be 3..30")
     if "stale_position_price_sec" in vals and not (15<=vals["stale_position_price_sec"]<=180):
