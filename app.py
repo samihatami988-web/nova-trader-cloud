@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "6.3.0"
+APP_VERSION = "6.4.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -298,6 +298,31 @@ DEFAULTS = {
     "pulse_buy_pressure_ceiling": "78",
     "pulse_unique_buyers_ceiling": "5",
 
+    "pulse_recovery_score": "72",
+    "pulse_recovery_events_5s": "3",
+    "pulse_recovery_buy_pressure": "64",
+    "pulse_recovery_unique_buyers": "2",
+    "pulse_confirmation_required": "2",
+    "pulse_confirmation_window_sec": "4",
+    "pulse_confirmation_min_gap_ms": "300",
+
+    "edge_governor_enabled": "true",
+    "governor_min_samples": "6",
+    "governor_recent_trades": "12",
+    "governor_probation_risk_multiplier": "0.25",
+    "governor_caution_risk_multiplier": "0.50",
+    "governor_min_profit_factor": "1.05",
+    "governor_pause_minutes": "90",
+    "governor_loss_streak_limit": "2",
+    "governor_loss_streak_pause_minutes": "30",
+    "survival_daily_loss_pct": "1.50",
+    "survival_combined_loss_pct": "1.50",
+    "recovery_spot_liquidity_position_cap_pct": "0.50",
+    "recovery_sniper_loss_cap_pct": "0.75",
+    "recovery_scalp_loss_cap_pct": "1.25",
+    "recovery_pump_loss_cap_pct": "1.75",
+    "recovery_perp_loss_cap_pct": "1.25",
+
     "daily_profit_target_pct": "10.0",
     "daily_profit_secure_buffer_pct": "0.25",
     "daily_de_risk_start_pct": "7.0",
@@ -417,6 +442,9 @@ runtime = {
     "pulse_adaptive_last": 0,
     "pulse_adaptive_actions": [],
     "pulse_last_perf_trade_id": 0,
+    "pulse_confirmations": {},
+    "governor_pauses": {},
+    "governor_last_reason": {},
 
     "engine_error_streak": 0,
     "last_decision_log": {},
@@ -1675,7 +1703,8 @@ def planned_collateral(c,strategy):
     pw=portfolio_weight(strategy)
     strategy_risk_mult=f("sniper_risk_multiplier") if strategy=="SNIPER_LONG" else 1.0
     target_mult=daily_target_risk_multiplier()
-    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult*target_mult
+    governor_mult=governor_risk_multiplier(strategy)
+    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult*target_mult*governor_mult
     effective_stop=strategy_max_loss_pct(strategy) if strategy=="SNIPER_LONG" else f("stop_loss_pct")
     collateral=risk_budget/max((effective_stop/100)*leverage,0.001)
     collateral=min(collateral,m["equity"]*f("max_position_pct")/100,f("cash"))
@@ -2028,6 +2057,90 @@ def adaptive_status():
         "optimizers":{s:optimizer_report(s) for s in strategies}
     }
 
+
+def strategy_recent_trade_stats(strategy,limit=None):
+    limit=limit or i("governor_recent_trades")
+    with SessionLocal() as s:
+        rows=s.scalars(
+            select(Trade).where(Trade.strategy==strategy).order_by(Trade.id.desc()).limit(limit)
+        ).all()
+
+    wins=[x for x in rows if nz(x.pnl)>0]
+    losses=[x for x in rows if nz(x.pnl)<=0]
+    gw=sum(nz(x.pnl) for x in wins)
+    gl=abs(sum(nz(x.pnl) for x in losses))
+    pf=gw/gl if gl>0 else (999 if gw>0 else 0)
+    exp_pct=sum(nz(x.pnl_pct) for x in rows)/len(rows) if rows else 0
+    streak=0
+    for x in rows:
+        if nz(x.pnl)<0:streak+=1
+        else:break
+    return {
+        "samples":len(rows),"wins":len(wins),
+        "win_rate":100*len(wins)/len(rows) if rows else 0,
+        "pnl":sum(nz(x.pnl) for x in rows),
+        "expectancy_pct":exp_pct,
+        "profit_factor":pf,
+        "loss_streak":streak
+    }
+
+def strategy_governor_status(strategy):
+    stats=strategy_recent_trade_stats(strategy)
+    pause_until=runtime["governor_pauses"].get(strategy)
+    if pause_until and datetime.now(timezone.utc)<pause_until:
+        return {"strategy":strategy,"state":"PAUSED","risk_multiplier":0.0,
+                "pause_until":pause_until.isoformat(),**stats}
+
+    if stats["loss_streak"]>=i("governor_loss_streak_limit"):
+        until=datetime.now(timezone.utc)+timedelta(minutes=i("governor_loss_streak_pause_minutes"))
+        runtime["governor_pauses"][strategy]=until
+        runtime["governor_last_reason"][strategy]="loss streak"
+        return {"strategy":strategy,"state":"PAUSED","risk_multiplier":0.0,
+                "pause_until":until.isoformat(),**stats}
+
+    if stats["samples"]<i("governor_min_samples"):
+        return {"strategy":strategy,"state":"PROBATION",
+                "risk_multiplier":f("governor_probation_risk_multiplier"),
+                "pause_until":None,**stats}
+
+    if stats["expectancy_pct"]<=0 or stats["profit_factor"]<f("governor_min_profit_factor"):
+        until=datetime.now(timezone.utc)+timedelta(minutes=i("governor_pause_minutes"))
+        runtime["governor_pauses"][strategy]=until
+        runtime["governor_last_reason"][strategy]="negative edge"
+        return {"strategy":strategy,"state":"PAUSED","risk_multiplier":0.0,
+                "pause_until":until.isoformat(),**stats}
+
+    if stats["profit_factor"]<1.15 or stats["win_rate"]<42:
+        return {"strategy":strategy,"state":"CAUTION",
+                "risk_multiplier":f("governor_caution_risk_multiplier"),
+                "pause_until":None,**stats}
+
+    return {"strategy":strategy,"state":"ENABLED","risk_multiplier":1.0,
+            "pause_until":None,**stats}
+
+def governor_risk_multiplier(strategy):
+    if not b("edge_governor_enabled"):return 1.0
+    return nz(strategy_governor_status(strategy).get("risk_multiplier"),0)
+
+def strategy_governor_gate(strategy):
+    if not b("edge_governor_enabled"):return True,"ok"
+    st=strategy_governor_status(strategy)
+    if st["state"]=="PAUSED":
+        return False,"edge governor paused strategy"
+    return True,"ok"
+
+def survival_guard_status():
+    realized=today_realized()
+    open_pnl=global_open_pnl()
+    combined=realized+open_pnl
+    day_limit=-(f("start_balance")*f("survival_daily_loss_pct")/100)
+    combined_limit=-(f("start_balance")*f("survival_combined_loss_pct")/100)
+    return {
+        "realized":realized,"open_pnl":open_pnl,"combined":combined,
+        "daily_limit_usd":day_limit,"combined_limit_usd":combined_limit,
+        "blocked":realized<=day_limit or combined<=combined_limit
+    }
+
 def gate(c,strategy=None):
     if b("killed"): return False,"kill switch"
     if not b("bot_enabled"): return False,"bot stopped"
@@ -2044,6 +2157,9 @@ def gate(c,strategy=None):
         spu=runtime["strategy_pauses"].get(strategy)
         if spu and datetime.now(timezone.utc)<spu:
             return False,"strategy adaptive pause"
+        gok,greason=strategy_governor_gate(strategy)
+        if not gok:
+            return False,greason
 
     # V5.1 HOTFIX:
     # SPOT and PERP no longer share one market-quality gate.
@@ -2105,6 +2221,8 @@ def gate(c,strategy=None):
         return False,"daily loss limit"
     if b("capital_shield_enabled") and global_equity_guard_status()["blocked"]:
         return False,"global equity guard"
+    if survival_guard_status()["blocked"]:
+        return False,"survival loss guard"
 
     if b("daily_target_lock_enabled"):
         target=daily_target_status()
@@ -2140,7 +2258,8 @@ def open_position(c,strategy):
     collateral=planned_collateral(c,strategy)
     if not c.get("perp_eligible") and b("capital_shield_enabled"):
         liq=max(0,nz(c.get("liquidity")))
-        liq_cap=liq*f("max_spot_position_liquidity_pct")/100
+        liq_pct=min(f("max_spot_position_liquidity_pct"),f("recovery_spot_liquidity_position_cap_pct"))
+        liq_cap=liq*liq_pct/100
         collateral=min(collateral,liq_cap)
     if collateral<5:return False,"position too small"
 
@@ -2269,8 +2388,10 @@ def close_position(p,c,reason):
     record_event("INFO","POSITION_CLOSED",f"{p.symbol} {p.strategy} closed: {reason}",
                  {"pnl":round(total,4),"pnl_pct":round(pnl_pct,3),"funding_pnl":round(funding_pnl,4)})
     maybe_pause_strategy(p.strategy)
-    if consecutive_losses()>=i("max_consecutive_losses"):
-        runtime["pause_until"]=datetime.now(timezone.utc)+timedelta(minutes=i("loss_pause_minutes"))
+    recovery_limit=min(i("max_consecutive_losses"),i("governor_loss_streak_limit"))
+    if consecutive_losses()>=recovery_limit:
+        pause_minutes=max(i("loss_pause_minutes"),i("governor_loss_streak_pause_minutes"))
+        runtime["pause_until"]=datetime.now(timezone.utc)+timedelta(minutes=pause_minutes)
 
 
 
@@ -2323,30 +2444,25 @@ def open_risk_pct():
     return total_risk/max(f("start_balance"),1e-9)*100.0
 
 def strategy_max_loss_pct(strategy):
-    if not b("capital_shield_enabled"):
-        return f("stop_loss_pct")
     hard=f("stop_loss_pct")
+    if not b("capital_shield_enabled"):
+        return hard
     if strategy=="SNIPER_LONG":
-        return min(hard,f("sniper_max_loss_pct"))
+        return min(hard,f("sniper_max_loss_pct"),f("recovery_sniper_loss_cap_pct"))
     if strategy=="SCALP_LONG":
-        return min(hard,f("scalp_max_loss_pct"))
+        return min(hard,f("scalp_max_loss_pct"),f("recovery_scalp_loss_cap_pct"))
     if strategy=="PUMP_LONG":
-        return min(hard,f("pump_max_loss_pct"))
+        return min(hard,f("pump_max_loss_pct"),f("recovery_pump_loss_cap_pct"))
     if strategy in ("PERP_LONG","PERP_SHORT"):
-        return min(hard,f("perp_max_loss_pct"))
+        return min(hard,f("perp_max_loss_pct"),f("recovery_perp_loss_cap_pct"))
     return hard
 
 def strategy_breakeven_rule(strategy):
-    # Net-return thresholds, after simulated execution friction.
-    if strategy=="SNIPER_LONG":
-        return 0.65,0.05
-    if strategy=="SCALP_LONG":
-        return 0.90,0.05
-    if strategy=="PUMP_LONG":
-        return 1.50,0.10
-    if strategy in ("PERP_LONG","PERP_SHORT"):
-        return 0.80,0.05
-    return 1.50,0.05
+    if strategy=="SNIPER_LONG":return 0.50,0.02
+    if strategy=="SCALP_LONG":return 0.75,0.02
+    if strategy=="PUMP_LONG":return 1.00,0.05
+    if strategy in ("PERP_LONG","PERP_SHORT"):return 0.70,0.02
+    return 1.0,0.02
 
 def global_open_pnl():
     positions=positions_with_marks()
@@ -2386,47 +2502,40 @@ def expected_exit_total_pct(p,c):
     return total/max(p.initial_notional,1e-9)*100
 
 def strategy_profit_lock(strategy,peak_net_pct):
-    """Return minimum net P&L floor after a winner has reached a given peak."""
     p=nz(peak_net_pct)
     if strategy=="SNIPER_LONG":
-        if p>=3.0:return max(2.0,p-0.9)
-        if p>=2.0:return 1.10
-        if p>=1.30:return 0.50
-        if p>=0.80:return 0.10
+        if p>=3:return max(2.0,p-0.8)
+        if p>=2:return 1.15
+        if p>=1.25:return 0.45
+        if p>=0.75:return 0.08
     elif strategy=="SCALP_LONG":
-        if p>=8:return max(4.0,p-2.5)
-        if p>=5:return 2.5
-        if p>=3:return 1.25
-        if p>=1.5:return 0.35
-        if p>=1.0:return 0.15
+        if p>=5:return max(3.0,p-1.5)
+        if p>=3:return 1.50
+        if p>=1.75:return 0.60
+        if p>=1.00:return 0.12
     elif strategy=="PUMP_LONG":
-        if p>=30:return max(14.0,p-9.0)
-        if p>=20:return 9.0
-        if p>=12:return 5.0
-        if p>=8:return 3.0
-        if p>=4:return 1.25
-        if p>=2:return 0.50
-        if p>=1.5:return 0.20
+        if p>=20:return max(10.0,p-6.0)
+        if p>=10:return 4.0
+        if p>=6:return 2.0
+        if p>=3:return 0.75
+        if p>=1.50:return 0.15
     elif strategy in ("PERP_LONG","PERP_SHORT"):
-        if p>=12:return max(6.0,p-4.0)
-        if p>=8:return 4.0
+        if p>=8:return max(4.0,p-3.0)
         if p>=5:return 2.0
-        if p>=3:return 1.0
-        if p>=1.5:return 0.30
-        if p>=1.0:return 0.15
+        if p>=2.5:return 0.75
+        if p>=1.0:return 0.10
     return None
 
 def strategy_tp_plan(strategy):
-    # Each tuple is: net-profit trigger %, fraction of original position to close.
     if strategy=="SNIPER_LONG":
-        return [(1.0,.35),(1.8,.35),(3.0,.30)]
+        return [(0.80,.40),(1.50,.35),(2.50,.25)]
     if strategy=="SCALP_LONG":
-        return [(2.0,.25),(3.5,.25),(5.0,.25)]
+        return [(1.50,.30),(2.50,.30),(4.00,.25)]
     if strategy=="PUMP_LONG":
-        return [(6.0,.15),(12.0,.20),(20.0,.25)]
+        return [(3.00,.20),(6.00,.20),(10.00,.20)]
     if strategy in ("PERP_LONG","PERP_SHORT"):
-        return [(2.5,.20),(5.0,.25),(8.0,.25)]
-    return [(8.0,.15),(15.0,.20),(25.0,.25)]
+        return [(1.50,.20),(3.00,.25),(5.00,.25)]
+    return [(2.0,.25),(4.0,.25),(6.0,.25)]
 
 def manage_positions():
     cands={x["mint"]:x for x in runtime["candidates"]}
@@ -2443,6 +2552,12 @@ def manage_positions():
 
     # Daily Profit Secure: once combined paper P&L exceeds target + buffer,
     # close open positions to bank the day and stop opening new trades.
+    survival=survival_guard_status()
+    survival_flatten=survival["blocked"] and bool(pos)
+    if survival_flatten:
+        record_event("WARN","SURVIVAL_GUARD","Recovery survival guard triggered",
+                     {"combined":survival["combined"],"daily":survival["realized"]},dedupe_sec=60)
+
     target=daily_target_status()
     secure_daily=b("daily_target_lock_enabled") and target["secure_ready"] and bool(pos)
     if secure_daily:
@@ -2486,6 +2601,8 @@ def manage_positions():
 
             if secure_daily:
                 reason="DAILY_TARGET_SECURE"
+            elif survival_flatten:
+                reason="SURVIVAL_GUARD"
             elif flatten_all:
                 reason="GLOBAL_EQUITY_GUARD"
 
@@ -2499,7 +2616,13 @@ def manage_positions():
                  peak_net_ret<0.40 and net_ret<=-f("sniper_scratch_loss_pct"):
                 reason="SNIPER_SCRATCH_EXIT"
 
-            # Ordinary scratch trades that fail to follow through.
+            # Strategy-specific recovery scratch: fail fast when there is no follow-through.
+            elif b("capital_shield_enabled") and obj.strategy=="SCALP_LONG" and held_minutes>=3 and \
+                 peak_net_ret<0.35 and net_ret<=-0.45:
+                reason="SCALP_SCRATCH_EXIT"
+            elif b("capital_shield_enabled") and obj.strategy=="PUMP_LONG" and held_minutes>=4 and \
+                 peak_net_ret<0.50 and net_ret<=-0.70:
+                reason="PUMP_SCRATCH_EXIT"
             elif b("capital_shield_enabled") and held_minutes>=f("scratch_after_minutes") and \
                  peak_net_ret<f("scratch_min_peak_pct") and net_ret<=-f("scratch_loss_pct"):
                 reason="SCRATCH_EXIT"
@@ -2579,7 +2702,10 @@ def pulse_metrics(mint):
     buys10=[e for e in e10 if e["buy"]]
     old=[e for e in e30 if now-e["t"]>5]
 
-    pressure=100*len(buys5)/max(len(e5),1)
+    raw_pressure=100*len(buys5)/max(len(e5),1)
+    # Beta(2,2) prior stops 1/1 from pretending to be a high-confidence 100% signal.
+    smoothed_pressure=100*(len(buys5)+2)/max(len(e5)+4,1)
+
     rate5=len(e5)/5.0
     old_rate=len(old)/25.0
     accel=clamp((rate5/max(old_rate,0.08))*18,0,100)
@@ -2589,15 +2715,26 @@ def pulse_metrics(mint):
     buy_sol5=sum(e.get("sol",0) for e in buys5)
     flow_score=clamp(20*math.log10(max(buy_sol5,0.01)*10+1),0,100)
 
-    score=clamp(
-        pressure*.27 + accel*.24 + frequency*.20 +
+    raw_score=clamp(
+        smoothed_pressure*.27 + accel*.24 + frequency*.20 +
         unique_score*.17 + flow_score*.12,0,100
     )
+
+    event_conf=clamp(len(e5)/5.0,0,1)
+    buyer_conf=clamp(unique_buyers/3.0,0,1)
+    sample_confidence=clamp(event_conf*.60+buyer_conf*.40,0,1)
+    confidence_factor=.75+.25*sample_confidence
+    score=clamp(raw_score*confidence_factor,0,100)
+
     last=buf[-1] if buf else {}
     return {
-        "mint":mint,"score":round(score,1),
+        "mint":mint,
+        "score":round(score,1),
+        "raw_score":round(raw_score,1),
+        "sample_confidence":round(sample_confidence*100,1),
         "events_2s":len(e2),"events_5s":len(e5),"events_10s":len(e10),
-        "buy_pressure_5s":round(pressure,1),
+        "buy_pressure_5s":round(smoothed_pressure,1),
+        "raw_buy_pressure_5s":round(raw_pressure,1),
         "unique_buyers_10s":unique_buyers,
         "buy_sol_5s":round(buy_sol5,4),
         "acceleration_score":round(accel,1),
@@ -2714,7 +2851,7 @@ async def realtime_exit_check(mint,m):
         if now-runtime["realtime_exit_last_eval"].get(rest_key,0)>=rest_gap:
             runtime["realtime_exit_last_eval"][rest_key]=now
             runtime["realtime_exit_rest_checks"]+=1
-            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.3"}) as client:
+            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.4"}) as client:
                 rows=await fetch_pairs(client,[mint],{})
                 if rows:
                     rows[0]["position_watch"]=True
@@ -2774,10 +2911,13 @@ async def sync_pulse_subscriptions(ws):
 
 def pulse_effective_thresholds():
     shifts=runtime["pulse_adaptive_shifts"]
-    base_score=f("pulse_min_score")
-    base_events=i("pulse_min_events_5s")
-    base_pressure=f("pulse_min_buy_pressure_5s")
-    base_buyers=i("pulse_min_unique_buyers_10s")
+
+    # Recovery baseline is deliberately more tradable than old persisted values,
+    # while still bounded by hard floors + confirmation + final safety gates.
+    base_score=min(f("pulse_min_score"),f("pulse_recovery_score"))
+    base_events=min(i("pulse_min_events_5s"),i("pulse_recovery_events_5s"))
+    base_pressure=min(f("pulse_min_buy_pressure_5s"),f("pulse_recovery_buy_pressure"))
+    base_buyers=min(i("pulse_min_unique_buyers_10s"),i("pulse_recovery_unique_buyers"))
 
     score=clamp(base_score+nz(shifts.get("score")),f("pulse_score_floor"),f("pulse_score_ceiling"))
     events=max(i("pulse_events_floor"),min(12,int(round(base_events+nz(shifts.get("events"))))))
@@ -2905,13 +3045,10 @@ def maybe_adapt_pulse_thresholds():
     counts=summary["counts"]
     observed=summary["observed_bursts"]
     min_obs=i("pulse_adapt_min_observations")
-
     shifts=runtime["pulse_adaptive_shifts"]
     changed=False
     message=None
 
-    # Performance guard: a new batch of closed sniper trades may only TIGHTEN,
-    # never loosen, thresholds when recent performance is weak.
     perf=pulse_recent_sniper_performance()
     if perf["count"]>=5 and perf["last_trade_id"]>runtime["pulse_last_perf_trade_id"]:
         runtime["pulse_last_perf_trade_id"]=perf["last_trade_id"]
@@ -2921,39 +3058,29 @@ def maybe_adapt_pulse_thresholds():
             changed=True
             message=f"Performance guard tightened Pulse: {perf['count']} trades, win {perf['win_rate']:.1f}%."
 
-    # If there are enough observed bursts but virtually no front-gate passes,
-    # relax ONLY the dominant bottleneck by one small notch, within hard floors.
     if not changed and observed>=min_obs:
         passes=counts.get("PULSE_GATE_PASS",0)
         pass_rate=passes/max(observed,1)
-        bottlenecks={
-            "LOW_SCORE":counts.get("LOW_SCORE",0),
-            "LOW_EVENTS":counts.get("LOW_EVENTS",0),
-            "LOW_BUY_PRESSURE":counts.get("LOW_BUY_PRESSURE",0),
-            "LOW_UNIQUE_BUYERS":counts.get("LOW_UNIQUE_BUYERS",0)
-        }
+        th=pulse_effective_thresholds()
 
-        if pass_rate<0.02 and max(bottlenecks.values() or [0])>0:
-            dominant=max(bottlenecks,key=bottlenecks.get)
-            th=pulse_effective_thresholds()
-            if dominant=="LOW_SCORE" and th["score"]>f("pulse_score_floor"):
-                shifts["score"]=nz(shifts.get("score"))-1
-                changed=True;message="Adaptive Pulse relaxed score by 1 point."
-            elif dominant=="LOW_EVENTS" and th["events_5s"]>i("pulse_events_floor"):
+        if pass_rate<0.02:
+            # Structure first: events -> independent buyers -> pressure -> score.
+            if counts.get("LOW_EVENTS",0)>0 and th["events_5s"]>i("pulse_events_floor"):
                 shifts["events"]=nz(shifts.get("events"))-1
                 changed=True;message="Adaptive Pulse relaxed 5s event count by 1."
-            elif dominant=="LOW_BUY_PRESSURE" and th["buy_pressure_5s"]>f("pulse_buy_pressure_floor"):
-                shifts["pressure"]=nz(shifts.get("pressure"))-1
-                changed=True;message="Adaptive Pulse relaxed buy pressure by 1 point."
-            elif dominant=="LOW_UNIQUE_BUYERS" and th["unique_buyers_10s"]>i("pulse_unique_buyers_floor"):
+            elif counts.get("LOW_UNIQUE_BUYERS",0)>0 and th["unique_buyers_10s"]>i("pulse_unique_buyers_floor"):
                 shifts["buyers"]=nz(shifts.get("buyers"))-1
                 changed=True;message="Adaptive Pulse relaxed unique buyers by 1."
+            elif counts.get("LOW_BUY_PRESSURE",0)>0 and th["buy_pressure_5s"]>f("pulse_buy_pressure_floor"):
+                shifts["pressure"]=nz(shifts.get("pressure"))-1
+                changed=True;message="Adaptive Pulse relaxed buy pressure by 1 point."
+            elif counts.get("LOW_SCORE",0)>0 and th["score"]>f("pulse_score_floor"):
+                shifts["score"]=nz(shifts.get("score"))-1
+                changed=True;message="Adaptive Pulse relaxed score by 1 point."
 
-        # If the pulse front gate is firing too often, tighten score modestly.
-        elif pass_rate>0.18 and passes>=8:
-            if pulse_effective_thresholds()["score"]<f("pulse_score_ceiling"):
-                shifts["score"]=nz(shifts.get("score"))+1
-                changed=True;message="Adaptive Pulse tightened score because too many bursts passed."
+        elif pass_rate>0.18 and passes>=8 and th["score"]<f("pulse_score_ceiling"):
+            shifts["score"]=nz(shifts.get("score"))+1
+            changed=True;message="Adaptive Pulse tightened score because too many bursts passed."
 
     if changed and message:
         pulse_adapt_action(message)
@@ -2962,24 +3089,24 @@ def pulse_gate_metrics(m):
     if not b("realtime_pulse_enabled"):
         return False,"pulse disabled"
 
-    # Ignore single-event noise in diagnostics; track actual micro-bursts.
-    candidate_worthy=int(m.get("events_5s") or 0)>=2 or nz(m.get("score"))>=40
-    if candidate_worthy:
+    # A real burst must have enough independent activity to be statistically meaningful.
+    real_burst=int(m.get("events_5s") or 0)>=3 and int(m.get("unique_buyers_10s") or 0)>=2
+    if real_burst:
         pulse_diag_record("OBSERVED",m=m,dedupe_sec=3)
 
     th=pulse_effective_thresholds()
     failures=[]
 
-    if nz(m.get("score"))<th["score"]:
-        failures.append(("LOW_SCORE","pulse score"))
     if int(m.get("events_5s") or 0)<th["events_5s"]:
         failures.append(("LOW_EVENTS","pulse event count"))
-    if nz(m.get("buy_pressure_5s"))<th["buy_pressure_5s"]:
-        failures.append(("LOW_BUY_PRESSURE","pulse buy pressure"))
     if int(m.get("unique_buyers_10s") or 0)<th["unique_buyers_10s"]:
         failures.append(("LOW_UNIQUE_BUYERS","pulse unique buyers"))
+    if nz(m.get("buy_pressure_5s"))<th["buy_pressure_5s"]:
+        failures.append(("LOW_BUY_PRESSURE","pulse buy pressure"))
+    if nz(m.get("score"))<th["score"]:
+        failures.append(("LOW_SCORE","pulse score"))
 
-    if candidate_worthy:
+    if real_burst:
         for diag_reason,_ in failures:
             pulse_diag_record(diag_reason,m=m,dedupe_sec=3)
 
@@ -2991,12 +3118,56 @@ def pulse_gate_metrics(m):
     maybe_adapt_pulse_thresholds()
     return True,"ok"
 
+
+def pulse_confirmation_ready(mint,m):
+    if not b("realtime_pulse_enabled"):
+        return False
+    now=time.time()
+    required=max(1,i("pulse_confirmation_required"))
+    if required<=1:return True
+
+    prev=runtime["pulse_confirmations"].get(mint)
+    if not prev or now-nz(prev.get("first_t"))>f("pulse_confirmation_window_sec"):
+        runtime["pulse_confirmations"][mint]={
+            "first_t":now,"last_t":now,"count":1,
+            "score":nz(m.get("score")),"events":int(m.get("events_5s") or 0)
+        }
+        pulse_diag_record("CONFIRM_WAIT",mint=mint,m=m,dedupe_sec=2)
+        return False
+
+    min_gap=max(.1,f("pulse_confirmation_min_gap_ms")/1000.0)
+    if now-nz(prev.get("last_t"))<min_gap:
+        return False
+
+    # Confirmation must not be a collapsing burst.
+    if nz(m.get("score")) < nz(prev.get("score"))-6:
+        runtime["pulse_confirmations"][mint]={
+            "first_t":now,"last_t":now,"count":1,
+            "score":nz(m.get("score")),"events":int(m.get("events_5s") or 0)
+        }
+        pulse_diag_record("CONFIRM_RESET",mint=mint,m=m,dedupe_sec=2)
+        return False
+
+    prev["count"]=int(prev.get("count") or 1)+1
+    prev["last_t"]=now
+    prev["score"]=max(nz(prev.get("score")),nz(m.get("score")))
+    prev["events"]=max(int(prev.get("events") or 0),int(m.get("events_5s") or 0))
+    runtime["pulse_confirmations"][mint]=prev
+
+    if prev["count"]>=required:
+        runtime["pulse_confirmations"].pop(mint,None)
+        pulse_diag_record("CONFIRMED",mint=mint,m=m,dedupe_sec=5)
+        return True
+    return False
+
 async def evaluate_pulse_mint(mint,m):
     if mint in runtime["pulse_evaluating"]:return
     runtime["pulse_evaluating"].add(mint)
     try:
         ok,reason=pulse_gate_metrics(m)
         if not ok:return
+        if not pulse_confirmation_ready(mint,m):
+            return
 
         # Prevent repeated evaluation/open attempts on the same burst.
         hot=runtime["pulse_hot"].get(mint,{})
@@ -3007,7 +3178,7 @@ async def evaluate_pulse_mint(mint,m):
         runtime["pulse_hot"][mint]=hot
 
         timeout=max(2,min(10,f("pulse_eval_timeout_sec")))
-        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.3"}) as client:
+        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.4"}) as client:
             rows=await asyncio.wait_for(fetch_pairs(client,[mint],{}),timeout=timeout)
             if not rows:
                 pulse_diag_record("NO_DEX_PAIR",mint=mint,m=m,dedupe_sec=10)
@@ -3326,7 +3497,7 @@ async def sniper_scan_loop():
     runtime["sniper_scanner_alive"]=True
     record_event("INFO","SNIPER_START","Micro-Pump Sniper scanner started",
                  {"interval_sec":i("sniper_scan_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.3"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.4"}) as client:
         while True:
             try:
                 if b("sniper_enabled"):
@@ -3388,7 +3559,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.3"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.4"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -3437,7 +3608,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.3"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.4"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -3644,6 +3815,30 @@ class SettingsIn(BaseModel):
     pulse_score_ceiling: Optional[float]=None
     pulse_buy_pressure_ceiling: Optional[float]=None
     pulse_unique_buyers_ceiling: Optional[int]=None
+    pulse_recovery_score: Optional[float]=None
+    pulse_recovery_events_5s: Optional[int]=None
+    pulse_recovery_buy_pressure: Optional[float]=None
+    pulse_recovery_unique_buyers: Optional[int]=None
+    pulse_confirmation_required: Optional[int]=None
+    pulse_confirmation_window_sec: Optional[float]=None
+    pulse_confirmation_min_gap_ms: Optional[float]=None
+
+    edge_governor_enabled: Optional[bool]=None
+    governor_min_samples: Optional[int]=None
+    governor_recent_trades: Optional[int]=None
+    governor_probation_risk_multiplier: Optional[float]=None
+    governor_caution_risk_multiplier: Optional[float]=None
+    governor_min_profit_factor: Optional[float]=None
+    governor_pause_minutes: Optional[int]=None
+    governor_loss_streak_limit: Optional[int]=None
+    governor_loss_streak_pause_minutes: Optional[int]=None
+    survival_daily_loss_pct: Optional[float]=None
+    survival_combined_loss_pct: Optional[float]=None
+    recovery_spot_liquidity_position_cap_pct: Optional[float]=None
+    recovery_sniper_loss_cap_pct: Optional[float]=None
+    recovery_scalp_loss_cap_pct: Optional[float]=None
+    recovery_pump_loss_cap_pct: Optional[float]=None
+    recovery_perp_loss_cap_pct: Optional[float]=None
 
     daily_profit_target_pct: Optional[float]=None
     daily_profit_secure_buffer_pct: Optional[float]=None
@@ -3706,6 +3901,12 @@ def dashboard():
             "no_martingale":b("no_martingale")
         },
         "pulse_intelligence":pulse_diag_summary(),
+        "edge_governor":{
+            "enabled":b("edge_governor_enabled"),
+            "strategies":{s:strategy_governor_status(s) for s in
+                ["SNIPER_LONG","SCALP_LONG","PUMP_LONG","PERP_LONG","PERP_SHORT"]}
+        },
+        "survival_guard":survival_guard_status(),
         "realtime_exit":{
             "enabled":b("realtime_exit_enabled"),
             "mode":"EVENT_DRIVEN" if runtime["pulse_stream_connected"] else "4S_FALLBACK",
@@ -3803,7 +4004,15 @@ def dashboard():
                 "pulse_diag_window_sec","pulse_adapt_interval_sec","pulse_adapt_min_observations",
                 "pulse_score_floor","pulse_events_floor","pulse_buy_pressure_floor",
                 "pulse_unique_buyers_floor","pulse_score_ceiling","pulse_buy_pressure_ceiling",
-                "pulse_unique_buyers_ceiling",
+                "pulse_unique_buyers_ceiling","pulse_recovery_score","pulse_recovery_events_5s",
+                "pulse_recovery_buy_pressure","pulse_recovery_unique_buyers",
+                "pulse_confirmation_required","pulse_confirmation_window_sec","pulse_confirmation_min_gap_ms",
+                "governor_min_samples","governor_recent_trades","governor_probation_risk_multiplier",
+                "governor_caution_risk_multiplier","governor_min_profit_factor","governor_pause_minutes",
+                "governor_loss_streak_limit","governor_loss_streak_pause_minutes",
+                "survival_daily_loss_pct","survival_combined_loss_pct",
+                "recovery_spot_liquidity_position_cap_pct","recovery_sniper_loss_cap_pct",
+                "recovery_scalp_loss_cap_pct","recovery_pump_loss_cap_pct","recovery_perp_loss_cap_pct",
                 "daily_profit_target_pct","daily_profit_secure_buffer_pct",
                 "daily_de_risk_start_pct","daily_de_risk_multiplier","max_total_open_risk_pct",
                 "min_liquidity","min_market_risk","min_spot_market_quality","execution_cost_pct","cooldown_minutes"
@@ -3820,6 +4029,7 @@ def dashboard():
             "realtime_pulse_enabled":b("realtime_pulse_enabled"),
             "realtime_exit_enabled":b("realtime_exit_enabled"),
             "adaptive_pulse_enabled":b("adaptive_pulse_enabled"),
+            "edge_governor_enabled":b("edge_governor_enabled"),
             "daily_target_lock_enabled":b("daily_target_lock_enabled"),
             "no_martingale":b("no_martingale"),
             "operating_mode":operating_mode()
@@ -3844,7 +4054,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.3"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.4"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
@@ -3927,7 +4137,7 @@ def control(action:str, x_nova_key:Optional[str]=Header(None)):
         with SessionLocal() as s:
             s.query(PositionFeature).delete();s.query(TradeFeature).delete();s.query(ExecutionEvent).delete();s.query(Position).delete();s.query(Trade).delete();s.query(EquityPoint).delete();s.commit()
         setv("cash",getv("start_balance"));setv("bot_enabled","false");setv("killed","false")
-        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["sniper_entries"]=0;runtime["sniper_candidates"]=[];runtime["pulse_entries"]=0;runtime["pulse_diag_events"].clear();runtime["pulse_diag_dedupe"].clear();runtime["pulse_recent_best"].clear();runtime["pulse_adaptive_shifts"]={"score":0.0,"events":0,"pressure":0.0,"buyers":0};runtime["pulse_adaptive_actions"].clear();runtime["pulse_last_perf_trade_id"]=0;runtime["realtime_exit_checks"]=0;runtime["realtime_exit_direct_marks"]=0;runtime["realtime_exit_rest_checks"]=0;runtime["realtime_exit_refs"].clear();runtime["daily_target_locked"]=False;runtime["daily_target_lock_time"]=None;runtime["pause_until"]=None
+        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["sniper_entries"]=0;runtime["sniper_candidates"]=[];runtime["pulse_entries"]=0;runtime["pulse_diag_events"].clear();runtime["pulse_diag_dedupe"].clear();runtime["pulse_recent_best"].clear();runtime["pulse_confirmations"].clear();runtime["governor_pauses"].clear();runtime["governor_last_reason"].clear();runtime["pulse_adaptive_shifts"]={"score":0.0,"events":0,"pressure":0.0,"buyers":0};runtime["pulse_adaptive_actions"].clear();runtime["pulse_last_perf_trade_id"]=0;runtime["realtime_exit_checks"]=0;runtime["realtime_exit_direct_marks"]=0;runtime["realtime_exit_rest_checks"]=0;runtime["realtime_exit_refs"].clear();runtime["daily_target_locked"]=False;runtime["daily_target_lock_time"]=None;runtime["pause_until"]=None
         record_event("INFO","PAPER_RESET","Paper account reset to start balance",{"start_balance":f("start_balance")},dedupe_sec=5)
     else: raise HTTPException(400,"Unknown action")
     return {"ok":True,"action":action}
