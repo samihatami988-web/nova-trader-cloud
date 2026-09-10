@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "6.4.0"
+APP_VERSION = "6.5.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -323,6 +323,15 @@ DEFAULTS = {
     "recovery_pump_loss_cap_pct": "1.75",
     "recovery_perp_loss_cap_pct": "1.25",
 
+    "selective_entry_router_enabled": "true",
+    "router_soft_market_quality_floor": "62",
+    "router_soft_liquidity_floor": "35000",
+    "router_min_signal_margin": "2",
+    "router_min_buy_pressure": "55",
+    "router_max_soft_m5_pct": "12",
+    "router_soft_risk_multiplier": "0.50",
+    "router_max_soft_entries_per_hour": "2",
+
     "daily_profit_target_pct": "10.0",
     "daily_profit_secure_buffer_pct": "0.25",
     "daily_de_risk_start_pct": "7.0",
@@ -445,6 +454,9 @@ runtime = {
     "pulse_confirmations": {},
     "governor_pauses": {},
     "governor_last_reason": {},
+    "router_soft_entry_times": [],
+    "router_last_entry": None,
+    "router_soft_entries": 0,
 
     "engine_error_streak": 0,
     "last_decision_log": {},
@@ -1696,6 +1708,130 @@ def execution_stats(limit=300):
         "recent":recent
     }
 
+
+def router_soft_entry_count():
+    now=time.time()
+    runtime["router_soft_entry_times"]=[
+        t for t in runtime["router_soft_entry_times"] if now-t<3600
+    ]
+    return len(runtime["router_soft_entry_times"])
+
+def entry_router_assess(c,strategy=None,signal=None):
+    strategy=strategy or suggested_strategy(c)
+    signal=nz(signal if signal is not None else strategy_entry_score(strategy,c))
+    threshold=effective_threshold(strategy,c)
+
+    result={
+        "state":"BLOCKED",
+        "reason":"unknown",
+        "strategy":strategy,
+        "signal":round(signal,1),
+        "threshold":round(threshold,1),
+        "soft":False,
+        "risk_multiplier":1.0,
+    }
+
+    if signal<threshold:
+        result["reason"]="signal below threshold"
+        return result
+
+    # Strict path first.
+    ok,reason=gate(c,strategy)
+    if ok:
+        collateral=planned_collateral(c,strategy)
+        if collateral<5:
+            result["reason"]="position too small"
+            return result
+        est=execution_cost_estimate(c,strategy,collateral*max(1.0,min(2.0,strategy_leverage(strategy))))
+        result["execution_cost_bps"]=round(nz(est.get("all_in_bps")),1)
+        if nz(est.get("all_in_bps"))>f("max_execution_cost_bps"):
+            result["reason"]="execution cost too high"
+            return result
+        result.update({"state":"READY","reason":"all final gates passed"})
+        return result
+
+    result["strict_reason"]=reason
+
+    # Never soften anything except near-miss spot liquidity/market-quality in PAPER.
+    if not b("selective_entry_router_enabled") or operating_mode()!="PAPER":
+        result["reason"]=reason
+        return result
+    if strategy not in ("SCALP_LONG","PUMP_LONG"):
+        result["reason"]=reason
+        return result
+    if reason not in ("low spot liquidity","low spot market quality"):
+        result["reason"]=reason
+        return result
+
+    liq=nz(c.get("liquidity"))
+    mq=nz(c.get("market_risk"))
+    bp=nz(c.get("buy_pressure"),50)
+    m5=nz(c.get("m5"))
+
+    if signal < threshold+f("router_min_signal_margin"):
+        result["reason"]="soft router needs stronger signal"
+        return result
+    if liq < f("router_soft_liquidity_floor"):
+        result["reason"]="liquidity below soft floor"
+        return result
+    if mq < f("router_soft_market_quality_floor"):
+        result["reason"]="market quality below soft floor"
+        return result
+    if bp < f("router_min_buy_pressure"):
+        result["reason"]="soft router weak buy pressure"
+        return result
+    if m5 > f("router_max_soft_m5_pct") or m5 < -2:
+        result["reason"]="soft router momentum unsafe"
+        return result
+    if router_soft_entry_count() >= i("router_max_soft_entries_per_hour"):
+        result["reason"]="soft-entry hourly limit"
+        return result
+
+    # Re-run every other guard with the controlled soft-pass flag.
+    probe=dict(c)
+    probe["_router_soft_pass"]=True
+    ok2,reason2=gate(probe,strategy)
+    if not ok2:
+        result["reason"]=reason2
+        return result
+
+    collateral=planned_collateral(probe,strategy)
+    if collateral<5:
+        result["reason"]="position too small"
+        return result
+
+    est=execution_cost_estimate(
+        probe,strategy,
+        collateral*max(1.0,min(2.0,strategy_leverage(strategy)))
+    )
+    result["execution_cost_bps"]=round(nz(est.get("all_in_bps")),1)
+    if nz(est.get("all_in_bps"))>f("max_execution_cost_bps"):
+        result["reason"]="execution cost too high"
+        return result
+
+    result.update({
+        "state":"SOFT_PASS",
+        "reason":"strong signal; controlled paper exploration",
+        "soft":True,
+        "risk_multiplier":f("router_soft_risk_multiplier"),
+        "liquidity":round(liq,2),
+        "market_quality":round(mq,1),
+        "buy_pressure":round(bp,1),
+    })
+    return result
+
+def attach_entry_router_status(c):
+    try:
+        strategy=c.get("best_strategy") or suggested_strategy(c)
+        signal=strategy_entry_score(strategy,c)
+        c["entry_router"]=entry_router_assess(c,strategy,signal)
+    except Exception as e:
+        c["entry_router"]={
+            "state":"BLOCKED","reason":f"router error: {str(e)[:80]}",
+            "strategy":c.get("best_strategy") or "UNKNOWN"
+        }
+    return c
+
 def planned_collateral(c,strategy):
     m=metrics()
     leverage=max(1.0,min(2.0,strategy_leverage(strategy)))
@@ -1704,7 +1840,8 @@ def planned_collateral(c,strategy):
     strategy_risk_mult=f("sniper_risk_multiplier") if strategy=="SNIPER_LONG" else 1.0
     target_mult=daily_target_risk_multiplier()
     governor_mult=governor_risk_multiplier(strategy)
-    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult*target_mult*governor_mult
+    router_mult=f("router_soft_risk_multiplier") if c.get("_router_soft_pass") else 1.0
+    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult*target_mult*governor_mult*router_mult
     effective_stop=strategy_max_loss_pct(strategy) if strategy=="SNIPER_LONG" else f("stop_loss_pct")
     collateral=risk_budget/max((effective_stop/100)*leverage,0.001)
     collateral=min(collateral,m["equity"]*f("max_position_pct")/100,f("cash"))
@@ -2182,7 +2319,20 @@ def gate(c,strategy=None):
         # Capital Shield applies stricter floors than older persisted dashboard settings.
         min_liq=f("min_liquidity")
         min_quality=f("min_spot_market_quality")
-        if b("capital_shield_enabled"):
+
+        router_soft=(
+            b("selective_entry_router_enabled")
+            and operating_mode()=="PAPER"
+            and bool(c.get("_router_soft_pass"))
+            and strategy in ("SCALP_LONG","PUMP_LONG")
+        )
+
+        if router_soft:
+            # Soft-pass only relaxes the SPOT floor slightly for PAPER exploration.
+            # All security, extreme-move, route, portfolio, execution and survival guards remain active.
+            min_liq=max(min_liq,f("router_soft_liquidity_floor"))
+            min_quality=max(min_quality,f("router_soft_market_quality_floor"))
+        elif b("capital_shield_enabled"):
             min_liq=max(min_liq,f("capital_shield_min_liquidity"))
             min_quality=max(min_quality,f("capital_shield_min_market_quality"))
 
@@ -2299,6 +2449,31 @@ def open_position(c,strategy):
         record_execution_event(position_id,None,c,strategy,"ENTRY",execution_notional,mid_price,fill_price,est)
     if not c.get("perp_eligible"):
         arm_realtime_exit_ref(c["mint"],position_id)
+
+    if c.get("_router_soft_pass"):
+        now_ts=time.time()
+        runtime["router_soft_entry_times"].append(now_ts)
+        runtime["router_soft_entries"]+=1
+        runtime["router_last_entry"]={
+            "time":datetime.now(timezone.utc).isoformat(),
+            "symbol":c.get("symbol"),"strategy":strategy,
+            "mode":"SOFT_PASS","signal":strategy_entry_score(strategy,c)
+        }
+        record_event(
+            "INFO","ROUTER_SOFT_ENTRY",
+            f"{c.get('symbol')} {strategy} controlled PAPER soft entry",
+            {"signal":strategy_entry_score(strategy,c),
+             "market_quality":c.get("market_risk"),
+             "liquidity":c.get("liquidity"),
+             "risk_multiplier":f("router_soft_risk_multiplier")},
+            dedupe_sec=10
+        )
+    else:
+        runtime["router_last_entry"]={
+            "time":datetime.now(timezone.utc).isoformat(),
+            "symbol":c.get("symbol"),"strategy":strategy,
+            "mode":"READY","signal":strategy_entry_score(strategy,c)
+        }
     return True,"opened"
 
 def partial_sell(p, c, fraction):
@@ -2851,7 +3026,7 @@ async def realtime_exit_check(mint,m):
         if now-runtime["realtime_exit_last_eval"].get(rest_key,0)>=rest_gap:
             runtime["realtime_exit_last_eval"][rest_key]=now
             runtime["realtime_exit_rest_checks"]+=1
-            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.4"}) as client:
+            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.5"}) as client:
                 rows=await fetch_pairs(client,[mint],{})
                 if rows:
                     rows[0]["position_watch"]=True
@@ -3178,7 +3353,7 @@ async def evaluate_pulse_mint(mint,m):
         runtime["pulse_hot"][mint]=hot
 
         timeout=max(2,min(10,f("pulse_eval_timeout_sec")))
-        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.4"}) as client:
+        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.5"}) as client:
             rows=await asyncio.wait_for(fetch_pairs(client,[mint],{}),timeout=timeout)
             if not rows:
                 pulse_diag_record("NO_DEX_PAIR",mint=mint,m=m,dedupe_sec=10)
@@ -3434,23 +3609,40 @@ def choose_entry():
     ranked=[]
     for signal,c,strategy in opportunities:
         quality,route=signal_quality(c,strategy,signal)
-        ranked.append((quality,signal,route,c,strategy))
-    ranked.sort(key=lambda x:x[0],reverse=True)
+        assessment=entry_router_assess(c,strategy,signal)
+        # READY first, then controlled SOFT_PASS, then quality.
+        state_rank={"READY":2,"SOFT_PASS":1,"BLOCKED":0}.get(assessment["state"],0)
+        ranked.append((state_rank,quality,signal,route,c,strategy,assessment))
+    ranked.sort(key=lambda x:(x[0],x[1]),reverse=True)
 
-    for quality,signal,route,c,strategy in ranked:
-        ok,reason=gate(c,strategy)
+    for state_rank,quality,signal,route,c,strategy,assessment in ranked:
+        c["entry_router"]=assessment
         sec_score=nz((c.get("security") or {}).get("score"),100 if c.get("perp_eligible") else 50)
-        if not ok:
-            log_decision(c,strategy,"BLOCKED",reason,signal,quality,route.get("quality",0),sec_score)
+
+        if assessment["state"]=="BLOCKED":
+            log_decision(c,strategy,"BLOCKED",assessment["reason"],
+                         signal,quality,route.get("quality",0),sec_score)
             continue
-        opened,oreason=open_position(c,strategy)
+
+        trade_candidate=dict(c)
+        if assessment["state"]=="SOFT_PASS":
+            trade_candidate["_router_soft_pass"]=True
+
+        opened,oreason=open_position(trade_candidate,strategy)
         if opened:
-            log_decision(c,strategy,"OPENED","entry accepted",signal,quality,route.get("quality",0),sec_score)
-            record_event("INFO","POSITION_OPENED",f"{c.get('symbol')} {strategy} opened",
-                         {"mode":operating_mode(),"signal":signal,"quality":quality,
-                          "route_quality":route.get("quality"),"security_score":sec_score})
+            outcome_reason="selective router soft pass" if assessment["state"]=="SOFT_PASS" else "entry accepted"
+            log_decision(c,strategy,"OPENED",outcome_reason,
+                         signal,quality,route.get("quality",0),sec_score)
+            record_event(
+                "INFO","POSITION_OPENED",f"{c.get('symbol')} {strategy} opened",
+                {"mode":operating_mode(),"router_state":assessment["state"],
+                 "signal":signal,"quality":quality,
+                 "route_quality":route.get("quality"),"security_score":sec_score}
+            )
             return
-        log_decision(c,strategy,"BLOCKED",oreason,signal,quality,route.get("quality",0),sec_score)
+
+        log_decision(c,strategy,"BLOCKED",oreason,
+                     signal,quality,route.get("quality",0),sec_score)
 
 
 def open_spot_mints():
@@ -3497,7 +3689,7 @@ async def sniper_scan_loop():
     runtime["sniper_scanner_alive"]=True
     record_event("INFO","SNIPER_START","Micro-Pump Sniper scanner started",
                  {"interval_sec":i("sniper_scan_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.4"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.5"}) as client:
         while True:
             try:
                 if b("sniper_enabled"):
@@ -3559,7 +3751,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.4"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.5"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -3608,7 +3800,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.4"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.5"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -3664,6 +3856,7 @@ async def engine_loop():
                         c["best_strategy"]=st
                         c["quality_score"]=quality
                         c["route"]=route
+                        attach_entry_router_status(c)
 
                     runtime["candidates"]=pairs
                     runtime["last_refresh"]=now_iso
@@ -3840,6 +4033,15 @@ class SettingsIn(BaseModel):
     recovery_pump_loss_cap_pct: Optional[float]=None
     recovery_perp_loss_cap_pct: Optional[float]=None
 
+    selective_entry_router_enabled: Optional[bool]=None
+    router_soft_market_quality_floor: Optional[float]=None
+    router_soft_liquidity_floor: Optional[float]=None
+    router_min_signal_margin: Optional[float]=None
+    router_min_buy_pressure: Optional[float]=None
+    router_max_soft_m5_pct: Optional[float]=None
+    router_soft_risk_multiplier: Optional[float]=None
+    router_max_soft_entries_per_hour: Optional[int]=None
+
     daily_profit_target_pct: Optional[float]=None
     daily_profit_secure_buffer_pct: Optional[float]=None
     daily_de_risk_start_pct: Optional[float]=None
@@ -3901,6 +4103,18 @@ def dashboard():
             "no_martingale":b("no_martingale")
         },
         "pulse_intelligence":pulse_diag_summary(),
+        "entry_router":{
+            "enabled":b("selective_entry_router_enabled"),
+            "soft_entries_last_hour":router_soft_entry_count(),
+            "soft_entries_total":runtime["router_soft_entries"],
+            "max_soft_entries_per_hour":i("router_max_soft_entries_per_hour"),
+            "last_entry":runtime["router_last_entry"],
+            "states":{
+                "READY":sum(1 for c in runtime.get("candidates",[])[:20] if (c.get("entry_router") or {}).get("state")=="READY"),
+                "SOFT_PASS":sum(1 for c in runtime.get("candidates",[])[:20] if (c.get("entry_router") or {}).get("state")=="SOFT_PASS"),
+                "BLOCKED":sum(1 for c in runtime.get("candidates",[])[:20] if (c.get("entry_router") or {}).get("state")=="BLOCKED")
+            }
+        },
         "edge_governor":{
             "enabled":b("edge_governor_enabled"),
             "strategies":{s:strategy_governor_status(s) for s in
@@ -4013,6 +4227,9 @@ def dashboard():
                 "survival_daily_loss_pct","survival_combined_loss_pct",
                 "recovery_spot_liquidity_position_cap_pct","recovery_sniper_loss_cap_pct",
                 "recovery_scalp_loss_cap_pct","recovery_pump_loss_cap_pct","recovery_perp_loss_cap_pct",
+                "router_soft_market_quality_floor","router_soft_liquidity_floor",
+                "router_min_signal_margin","router_min_buy_pressure","router_max_soft_m5_pct",
+                "router_soft_risk_multiplier","router_max_soft_entries_per_hour",
                 "daily_profit_target_pct","daily_profit_secure_buffer_pct",
                 "daily_de_risk_start_pct","daily_de_risk_multiplier","max_total_open_risk_pct",
                 "min_liquidity","min_market_risk","min_spot_market_quality","execution_cost_pct","cooldown_minutes"
@@ -4030,6 +4247,7 @@ def dashboard():
             "realtime_exit_enabled":b("realtime_exit_enabled"),
             "adaptive_pulse_enabled":b("adaptive_pulse_enabled"),
             "edge_governor_enabled":b("edge_governor_enabled"),
+            "selective_entry_router_enabled":b("selective_entry_router_enabled"),
             "daily_target_lock_enabled":b("daily_target_lock_enabled"),
             "no_martingale":b("no_martingale"),
             "operating_mode":operating_mode()
@@ -4054,7 +4272,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.4"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.5"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
@@ -4137,7 +4355,7 @@ def control(action:str, x_nova_key:Optional[str]=Header(None)):
         with SessionLocal() as s:
             s.query(PositionFeature).delete();s.query(TradeFeature).delete();s.query(ExecutionEvent).delete();s.query(Position).delete();s.query(Trade).delete();s.query(EquityPoint).delete();s.commit()
         setv("cash",getv("start_balance"));setv("bot_enabled","false");setv("killed","false")
-        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["sniper_entries"]=0;runtime["sniper_candidates"]=[];runtime["pulse_entries"]=0;runtime["pulse_diag_events"].clear();runtime["pulse_diag_dedupe"].clear();runtime["pulse_recent_best"].clear();runtime["pulse_confirmations"].clear();runtime["governor_pauses"].clear();runtime["governor_last_reason"].clear();runtime["pulse_adaptive_shifts"]={"score":0.0,"events":0,"pressure":0.0,"buyers":0};runtime["pulse_adaptive_actions"].clear();runtime["pulse_last_perf_trade_id"]=0;runtime["realtime_exit_checks"]=0;runtime["realtime_exit_direct_marks"]=0;runtime["realtime_exit_rest_checks"]=0;runtime["realtime_exit_refs"].clear();runtime["daily_target_locked"]=False;runtime["daily_target_lock_time"]=None;runtime["pause_until"]=None
+        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["sniper_entries"]=0;runtime["sniper_candidates"]=[];runtime["pulse_entries"]=0;runtime["pulse_diag_events"].clear();runtime["pulse_diag_dedupe"].clear();runtime["pulse_recent_best"].clear();runtime["pulse_confirmations"].clear();runtime["governor_pauses"].clear();runtime["governor_last_reason"].clear();runtime["router_soft_entry_times"].clear();runtime["router_last_entry"]=None;runtime["router_soft_entries"]=0;runtime["pulse_adaptive_shifts"]={"score":0.0,"events":0,"pressure":0.0,"buyers":0};runtime["pulse_adaptive_actions"].clear();runtime["pulse_last_perf_trade_id"]=0;runtime["realtime_exit_checks"]=0;runtime["realtime_exit_direct_marks"]=0;runtime["realtime_exit_rest_checks"]=0;runtime["realtime_exit_refs"].clear();runtime["daily_target_locked"]=False;runtime["daily_target_lock_time"]=None;runtime["pause_until"]=None
         record_event("INFO","PAPER_RESET","Paper account reset to start balance",{"start_balance":f("start_balance")},dedupe_sec=5)
     else: raise HTTPException(400,"Unknown action")
     return {"ok":True,"action":action}
@@ -4156,6 +4374,14 @@ def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
         raise HTTPException(400,"stop_loss_pct must be 0.5..15")
     if "correlation_threshold" in vals and not (0.3<=vals["correlation_threshold"]<=0.99):
         raise HTTPException(400,"correlation_threshold must be 0.30..0.99")
+    if "router_soft_market_quality_floor" in vals and not (58<=vals["router_soft_market_quality_floor"]<=70):
+        raise HTTPException(400,"router_soft_market_quality_floor must be 58..70")
+    if "router_soft_liquidity_floor" in vals and not (25000<=vals["router_soft_liquidity_floor"]<=50000):
+        raise HTTPException(400,"router_soft_liquidity_floor must be 25000..50000")
+    if "router_soft_risk_multiplier" in vals and not (0.10<=vals["router_soft_risk_multiplier"]<=0.75):
+        raise HTTPException(400,"router_soft_risk_multiplier must be 0.10..0.75")
+    if "router_max_soft_entries_per_hour" in vals and not (1<=vals["router_max_soft_entries_per_hour"]<=6):
+        raise HTTPException(400,"router_max_soft_entries_per_hour must be 1..6")
     if "pulse_score_floor" in vals and not (60<=vals["pulse_score_floor"]<=80):
         raise HTTPException(400,"pulse_score_floor must be 60..80")
     if "pulse_buy_pressure_floor" in vals and not (55<=vals["pulse_buy_pressure_floor"]<=75):
