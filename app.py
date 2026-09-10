@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "5.6.1"
+APP_VERSION = "6.0.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -266,6 +266,14 @@ DEFAULTS = {
     "sniper_scratch_loss_pct": "0.35",
     "sniper_max_hold_minutes": "5",
 
+    "daily_profit_target_pct": "10.0",
+    "daily_profit_secure_buffer_pct": "0.25",
+    "daily_de_risk_start_pct": "7.0",
+    "daily_de_risk_multiplier": "0.50",
+    "daily_target_lock_enabled": "true",
+    "no_martingale": "true",
+    "max_total_open_risk_pct": "3.0",
+
     "position_watch_interval_sec": "4",
     "stale_position_price_sec": "45",
     "readiness_min_trades": "100",
@@ -348,6 +356,8 @@ runtime = {
     "sniper_scan_error": None,
     "sniper_entries": 0,
     "sniper_candidates": [],
+    "daily_target_locked": False,
+    "daily_target_lock_time": None,
     "engine_error_streak": 0,
     "last_decision_log": {},
     "last_event_log": {},
@@ -1604,7 +1614,8 @@ def planned_collateral(c,strategy):
     rm=risk_multiplier()
     pw=portfolio_weight(strategy)
     strategy_risk_mult=f("sniper_risk_multiplier") if strategy=="SNIPER_LONG" else 1.0
-    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult
+    target_mult=daily_target_risk_multiplier()
+    risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult*target_mult
     effective_stop=strategy_max_loss_pct(strategy) if strategy=="SNIPER_LONG" else f("stop_loss_pct")
     collateral=risk_budget/max((effective_stop/100)*leverage,0.001)
     collateral=min(collateral,m["equity"]*f("max_position_pct")/100,f("cash"))
@@ -2035,6 +2046,17 @@ def gate(c,strategy=None):
     if b("capital_shield_enabled") and global_equity_guard_status()["blocked"]:
         return False,"global equity guard"
 
+    if b("daily_target_lock_enabled"):
+        target=daily_target_status()
+        if target["locked"]:
+            runtime["daily_target_locked"]=True
+            if not runtime.get("daily_target_lock_time"):
+                runtime["daily_target_lock_time"]=datetime.now(timezone.utc).isoformat()
+            return False,"daily profit target locked"
+
+    if open_risk_pct() >= f("max_total_open_risk_pct"):
+        return False,"portfolio open risk cap"
+
     if strategy:
         rok,rreason,rdetail=route_gate(c,strategy)
         if not rok:
@@ -2187,6 +2209,54 @@ def close_position(p,c,reason):
 
 
 
+
+def daily_target_status():
+    realized=today_realized()
+    open_pnl=global_open_pnl()
+    combined=realized+open_pnl
+    target_usd=f("start_balance")*f("daily_profit_target_pct")/100.0
+    derisk_usd=f("start_balance")*f("daily_de_risk_start_pct")/100.0
+    secure_trigger_usd=f("start_balance")*(f("daily_profit_target_pct")+f("daily_profit_secure_buffer_pct"))/100.0
+
+    hit_realized=realized>=target_usd
+    secure_ready=combined>=secure_trigger_usd
+    derisk=combined>=derisk_usd or realized>=derisk_usd
+
+    return {
+        "target_pct":f("daily_profit_target_pct"),
+        "target_usd":target_usd,
+        "de_risk_start_pct":f("daily_de_risk_start_pct"),
+        "de_risk":derisk,
+        "realized":realized,
+        "open_pnl":open_pnl,
+        "combined":combined,
+        "progress_pct":clamp(combined/max(target_usd,1e-9)*100,0,200),
+        "target_hit_realized":hit_realized,
+        "secure_ready":secure_ready,
+        "locked":runtime.get("daily_target_locked",False) or hit_realized,
+        "lock_time":runtime.get("daily_target_lock_time"),
+        "note":"Target is a risk-management objective, not a guaranteed return."
+    }
+
+def daily_target_risk_multiplier():
+    if not b("daily_target_lock_enabled"):
+        return 1.0
+    st=daily_target_status()
+    if st["locked"]:
+        return 0.0
+    if st["de_risk"]:
+        return clamp(f("daily_de_risk_multiplier"),0.1,1.0)
+    return 1.0
+
+def open_risk_pct():
+    with SessionLocal() as s:
+        rows=s.scalars(select(Position)).all()
+    total_risk=0.0
+    for p in rows:
+        stop=strategy_max_loss_pct(p.strategy)/100.0
+        total_risk += max(0,nz(p.remaining_cost))*stop
+    return total_risk/max(f("start_balance"),1e-9)*100.0
+
 def strategy_max_loss_pct(strategy):
     if not b("capital_shield_enabled"):
         return f("stop_loss_pct")
@@ -2306,6 +2376,14 @@ def manage_positions():
         record_event("WARN","GLOBAL_EQUITY_GUARD","Global equity guard triggered",
                      {"combined_pnl":guard["combined_pnl"],"limit_usd":guard["limit_usd"]},dedupe_sec=60)
 
+    # Daily Profit Secure: once combined paper P&L exceeds target + buffer,
+    # close open positions to bank the day and stop opening new trades.
+    target=daily_target_status()
+    secure_daily=b("daily_target_lock_enabled") and target["secure_ready"] and bool(pos)
+    if secure_daily:
+        record_event("INFO","DAILY_TARGET_SECURE","Daily profit target secure triggered",
+                     {"combined":target["combined"],"target_usd":target["target_usd"]},dedupe_sec=60)
+
     for p in pos:
         c=cands.get(p.mint)
         if not c:
@@ -2341,7 +2419,9 @@ def manage_positions():
                 max_hold=f("perp_max_hold_minutes") if str(obj.strategy).startswith("PERP_") else f("spot_max_hold_minutes")
             reason=None
 
-            if flatten_all:
+            if secure_daily:
+                reason="DAILY_TARGET_SECURE"
+            elif flatten_all:
                 reason="GLOBAL_EQUITY_GUARD"
 
             # Strategy-specific hard stop is intentionally tighter than the user-visible
@@ -2414,6 +2494,9 @@ def manage_positions():
 
         if reason:
             close_position(obj,c,reason)
+            if reason=="DAILY_TARGET_SECURE":
+                runtime["daily_target_locked"]=True
+                runtime["daily_target_lock_time"]=datetime.now(timezone.utc).isoformat()
 
 
 def sniper_gate(c):
@@ -2565,7 +2648,7 @@ async def sniper_scan_loop():
     runtime["sniper_scanner_alive"]=True
     record_event("INFO","SNIPER_START","Micro-Pump Sniper scanner started",
                  {"interval_sec":i("sniper_scan_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/5.6.1"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.0"}) as client:
         while True:
             try:
                 if b("sniper_enabled"):
@@ -2627,7 +2710,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/5.6.1"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.0"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -2676,7 +2759,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.6.1"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.0"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -2766,6 +2849,9 @@ async def startup():
         setv("position_watch_interval_sec","4")
     if i("sniper_scan_interval_sec") != 8:
         setv("sniper_scan_interval_sec","8")
+    if today_realized() < f("start_balance")*f("daily_profit_target_pct")/100:
+        runtime["daily_target_locked"]=False
+        runtime["daily_target_lock_time"]=None
     asyncio.create_task(engine_loop())
     asyncio.create_task(position_watch_loop())
     asyncio.create_task(sniper_scan_loop())
@@ -2854,6 +2940,14 @@ class SettingsIn(BaseModel):
     sniper_scratch_loss_pct: Optional[float]=None
     sniper_max_hold_minutes: Optional[float]=None
 
+    daily_profit_target_pct: Optional[float]=None
+    daily_profit_secure_buffer_pct: Optional[float]=None
+    daily_de_risk_start_pct: Optional[float]=None
+    daily_de_risk_multiplier: Optional[float]=None
+    daily_target_lock_enabled: Optional[bool]=None
+    no_martingale: Optional[bool]=None
+    max_total_open_risk_pct: Optional[float]=None
+
     position_watch_interval_sec: Optional[int]=None
     stale_position_price_sec: Optional[int]=None
     readiness_min_trades: Optional[int]=None
@@ -2899,6 +2993,13 @@ def dashboard():
         "velocity_source_ok":runtime["velocity_source_ok"],
         "last_velocity_refresh":runtime["last_velocity_refresh"],
         "metrics":{**metrics(),**today_guard_status(),"equity_guard":global_equity_guard_status()},
+        "daily_target":daily_target_status(),
+        "risk_status":{
+            "open_risk_pct":round(open_risk_pct(),3),
+            "max_total_open_risk_pct":f("max_total_open_risk_pct"),
+            "target_risk_multiplier":daily_target_risk_multiplier(),
+            "no_martingale":b("no_martingale")
+        },
         "sniper":{
             "enabled":b("sniper_enabled"),
             "alive":runtime["sniper_scanner_alive"],
@@ -2962,7 +3063,8 @@ def dashboard():
                 "sniper_min_volume_accel","sniper_min_m5_pct","sniper_max_m5_pct",
                 "sniper_max_age_minutes","sniper_max_positions","sniper_risk_multiplier",
                 "sniper_max_loss_pct","sniper_scratch_minutes","sniper_scratch_loss_pct",
-                "sniper_max_hold_minutes",
+                "sniper_max_hold_minutes","daily_profit_target_pct","daily_profit_secure_buffer_pct",
+                "daily_de_risk_start_pct","daily_de_risk_multiplier","max_total_open_risk_pct",
                 "min_liquidity","min_market_risk","min_spot_market_quality","execution_cost_pct","cooldown_minutes"
             ]},
             "block_extreme_volatility":b("block_extreme_volatility"),
@@ -2974,6 +3076,8 @@ def dashboard():
             "profit_lock_enabled":b("profit_lock_enabled"),
             "capital_shield_enabled":b("capital_shield_enabled"),
             "sniper_enabled":b("sniper_enabled"),
+            "daily_target_lock_enabled":b("daily_target_lock_enabled"),
+            "no_martingale":b("no_martingale"),
             "operating_mode":operating_mode()
         }
     }
@@ -2996,7 +3100,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.6.1"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.0"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
@@ -3079,7 +3183,7 @@ def control(action:str, x_nova_key:Optional[str]=Header(None)):
         with SessionLocal() as s:
             s.query(PositionFeature).delete();s.query(TradeFeature).delete();s.query(ExecutionEvent).delete();s.query(Position).delete();s.query(Trade).delete();s.query(EquityPoint).delete();s.commit()
         setv("cash",getv("start_balance"));setv("bot_enabled","false");setv("killed","false")
-        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["sniper_entries"]=0;runtime["sniper_candidates"]=[];runtime["pause_until"]=None
+        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["sniper_entries"]=0;runtime["sniper_candidates"]=[];runtime["daily_target_locked"]=False;runtime["daily_target_lock_time"]=None;runtime["pause_until"]=None
         record_event("INFO","PAPER_RESET","Paper account reset to start balance",{"start_balance":f("start_balance")},dedupe_sec=5)
     else: raise HTTPException(400,"Unknown action")
     return {"ok":True,"action":action}
@@ -3098,6 +3202,14 @@ def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
         raise HTTPException(400,"stop_loss_pct must be 0.5..15")
     if "correlation_threshold" in vals and not (0.3<=vals["correlation_threshold"]<=0.99):
         raise HTTPException(400,"correlation_threshold must be 0.30..0.99")
+    if "daily_profit_target_pct" in vals and not (1<=vals["daily_profit_target_pct"]<=25):
+        raise HTTPException(400,"daily_profit_target_pct must be 1..25")
+    if "daily_de_risk_start_pct" in vals and not (0.5<=vals["daily_de_risk_start_pct"]<=20):
+        raise HTTPException(400,"daily_de_risk_start_pct must be 0.5..20")
+    if "daily_de_risk_multiplier" in vals and not (0.1<=vals["daily_de_risk_multiplier"]<=1.0):
+        raise HTTPException(400,"daily_de_risk_multiplier must be 0.1..1.0")
+    if "max_total_open_risk_pct" in vals and not (0.5<=vals["max_total_open_risk_pct"]<=10):
+        raise HTTPException(400,"max_total_open_risk_pct must be 0.5..10")
     if "sniper_scan_interval_sec" in vals and not (5<=vals["sniper_scan_interval_sec"]<=30):
         raise HTTPException(400,"sniper_scan_interval_sec must be 5..30")
     if "sniper_risk_multiplier" in vals and not (0.1<=vals["sniper_risk_multiplier"]<=1.0):
