@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "5.1.0"
+APP_VERSION = "5.2.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -237,6 +237,8 @@ DEFAULTS = {
     "reversal_exit_edge": "15",
     "breakeven_trigger_pct": "6",
     "breakeven_exit_pct": "0.5",
+    "position_watch_interval_sec": "8",
+    "stale_position_price_sec": "45",
     "readiness_min_trades": "100",
     "readiness_min_pf": "1.15",
     "readiness_min_shadow_hours": "24",
@@ -307,6 +309,8 @@ runtime = {
     "last_spot_refresh": None,
     "last_perp_refresh": None,
     "last_successful_loop": None,
+    "last_position_watch": 0,
+    "position_price_seen": {},
     "engine_error_streak": 0,
     "last_decision_log": {},
     "last_event_log": {},
@@ -2085,7 +2089,15 @@ def manage_positions():
         for p in pos:s.expunge(p)
     for p in pos:
         c=cands.get(p.mint)
-        if not c:continue
+        if not c:
+            # Do not silently pretend the position is healthy. The dedicated
+            # watcher should repopulate it; until then record a warning.
+            last_seen=runtime["position_price_seen"].get(p.mint,0)
+            if time.time()-last_seen>f("stale_position_price_sec"):
+                record_event("WARN","POSITION_PRICE_STALE",f"{p.symbol} open-position price is stale",
+                             {"mint":p.mint,"strategy":p.strategy},dedupe_sec=120)
+            continue
+        runtime["position_price_seen"][p.mint]=time.time()
         with SessionLocal() as s:
             obj=s.get(Position,p.id)
             if not obj:continue
@@ -2177,10 +2189,42 @@ def choose_entry():
             return
         log_decision(c,strategy,"BLOCKED",oreason,signal,quality,route.get("quality",0),sec_score)
 
+
+def open_spot_mints():
+    with SessionLocal() as s:
+        rows=s.scalars(select(Position)).all()
+    out=[]
+    for p in rows:
+        if not str(p.strategy).startswith("PERP_") and p.mint and not str(p.mint).startswith("velocity:"):
+            out.append(p.mint)
+    return list(dict.fromkeys(out))
+
+async def fetch_open_spot_pairs(client,boosts):
+    mints=open_spot_mints()
+    if not mints:return []
+    # Fetch separately from scanner so open positions never disappear merely
+    # because the token drops out of discovery/top-candidate ranking.
+    rows=await fetch_pairs(client,mints,boosts)
+    now=time.time()
+    for c in rows:
+        runtime["position_price_seen"][c["mint"]]=now
+        c["position_watch"]=True
+    return rows
+
+def today_guard_status():
+    realized=today_realized()
+    limit=-(f("start_balance")*f("daily_loss_limit_pct")/100)
+    return {
+        "today_pnl":realized,
+        "loss_limit_usd":limit,
+        "blocked":realized<=limit,
+        "remaining_before_guard":max(0,realized-limit) if realized>limit else 0
+    }
+
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.1"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.2"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -2190,6 +2234,16 @@ async def engine_loop():
                     addresses,boosts=await discover(client);last_discovery=now
 
                 spot_pairs=await fetch_pairs(client,addresses,boosts)
+
+                # CRITICAL V5.2: open spot positions are fetched independently of
+                # discovery ranking, so stop/trailing management cannot lose track
+                # of a token merely because it leaves the candidate list.
+                open_spot_pairs=await fetch_open_spot_pairs(client,boosts)
+                if open_spot_pairs:
+                    by_mint={c["mint"]:c for c in spot_pairs}
+                    for c in open_spot_pairs:by_mint[c["mint"]]=c
+                    spot_pairs=list(by_mint.values())
+
                 if spot_pairs:
                     runtime["last_spot_refresh"]=now_iso
 
@@ -2311,6 +2365,8 @@ class SettingsIn(BaseModel):
     reversal_exit_edge: Optional[float]=None
     breakeven_trigger_pct: Optional[float]=None
     breakeven_exit_pct: Optional[float]=None
+    position_watch_interval_sec: Optional[int]=None
+    stale_position_price_sec: Optional[int]=None
     readiness_min_trades: Optional[int]=None
     readiness_min_pf: Optional[float]=None
     readiness_min_shadow_hours: Optional[float]=None
@@ -2353,7 +2409,7 @@ def dashboard():
         "last_refresh":runtime["last_refresh"],"last_error":runtime["last_error"],
         "velocity_source_ok":runtime["velocity_source_ok"],
         "last_velocity_refresh":runtime["last_velocity_refresh"],
-        "metrics":metrics(),
+        "metrics":{**metrics(),**today_guard_status()},
         "equity_curve":equity_curve(120),
         "adaptive":adaptive_status(),
         "research_status":snapshot_stats(),
@@ -2385,7 +2441,7 @@ def dashboard():
                 "impact_coefficient_bps","simulated_latency_ms","max_execution_cost_bps",
                 "max_data_age_sec","min_token_security_score","security_scan_ttl_sec","security_scan_top_n",
                 "min_route_quality","spot_max_hold_minutes","perp_max_hold_minutes","reversal_exit_edge",
-                "breakeven_trigger_pct","breakeven_exit_pct","readiness_min_trades","readiness_min_pf",
+                "breakeven_trigger_pct","breakeven_exit_pct","position_watch_interval_sec","stale_position_price_sec","readiness_min_trades","readiness_min_pf",
                 "readiness_min_shadow_hours","readiness_max_drawdown_pct","readiness_max_mc_below_start_pct",
                 "readiness_min_wf_robust","readiness_max_exec_bps",
                 "min_liquidity","min_market_risk","min_spot_market_quality","execution_cost_pct","cooldown_minutes"
@@ -2418,7 +2474,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.1"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.2"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
@@ -2501,7 +2557,8 @@ def control(action:str, x_nova_key:Optional[str]=Header(None)):
         with SessionLocal() as s:
             s.query(PositionFeature).delete();s.query(TradeFeature).delete();s.query(ExecutionEvent).delete();s.query(Position).delete();s.query(Trade).delete();s.query(EquityPoint).delete();s.commit()
         setv("cash",getv("start_balance"));setv("bot_enabled","false");setv("killed","false")
-        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["pause_until"]=None
+        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["pause_until"]=None
+        record_event("INFO","PAPER_RESET","Paper account reset to start balance",{"start_balance":f("start_balance")},dedupe_sec=5)
     else: raise HTTPException(400,"Unknown action")
     return {"ok":True,"action":action}
 
@@ -2519,6 +2576,10 @@ def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
         raise HTTPException(400,"stop_loss_pct must be 0.5..15")
     if "correlation_threshold" in vals and not (0.3<=vals["correlation_threshold"]<=0.99):
         raise HTTPException(400,"correlation_threshold must be 0.30..0.99")
+    if "position_watch_interval_sec" in vals and not (5<=vals["position_watch_interval_sec"]<=30):
+        raise HTTPException(400,"position_watch_interval_sec must be 5..30")
+    if "stale_position_price_sec" in vals and not (15<=vals["stale_position_price_sec"]<=180):
+        raise HTTPException(400,"stale_position_price_sec must be 15..180")
     for k,v in vals.items():setv(k,v)
     record_event("INFO","SETTINGS_UPDATE","Risk/strategy settings updated",{"keys":list(vals.keys())},dedupe_sec=5)
     return {"ok":True,"updated":list(vals.keys())}
