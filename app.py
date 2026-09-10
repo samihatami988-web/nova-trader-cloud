@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "5.6.0"
+APP_VERSION = "5.6.1"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -2565,7 +2565,7 @@ async def sniper_scan_loop():
     runtime["sniper_scanner_alive"]=True
     record_event("INFO","SNIPER_START","Micro-Pump Sniper scanner started",
                  {"interval_sec":i("sniper_scan_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/5.6"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/5.6.1"}) as client:
         while True:
             try:
                 if b("sniper_enabled"):
@@ -2627,13 +2627,14 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/5.5"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/5.6.1"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
                     positions=s.scalars(select(Position)).all()
                     for p in positions:s.expunge(p)
 
+                runtime["last_position_watch"]=time.time()
                 if positions:
                     updates=[]
                     spot_mints=[p.mint for p in positions if not str(p.strategy).startswith("PERP_")]
@@ -2652,7 +2653,6 @@ async def position_watch_loop():
                             updates.extend([c for c in perps if c["mint"] in open_mints])
 
                     merge_position_updates(updates)
-                    runtime["last_position_watch"]=time.time()
                     runtime["position_watch_error"]=None
                     await manage_positions_safe()
 
@@ -2676,7 +2676,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.6"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.6.1"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -2760,6 +2760,12 @@ async def engine_loop():
 
 @app.on_event("startup")
 async def startup():
+    # V5.6.1 critical cadence migration: older DB values can survive deploys.
+    # Only operational polling cadences are migrated; user risk/strategy settings are preserved.
+    if i("position_watch_interval_sec") != 4:
+        setv("position_watch_interval_sec","4")
+    if i("sniper_scan_interval_sec") != 8:
+        setv("sniper_scan_interval_sec","8")
     asyncio.create_task(engine_loop())
     asyncio.create_task(position_watch_loop())
     asyncio.create_task(sniper_scan_loop())
@@ -2910,6 +2916,7 @@ def dashboard():
         "fast_watcher":{
             "alive":runtime["position_watcher_alive"],
             "interval_sec":i("position_watch_interval_sec"),
+            "open_positions":metrics()["open_positions"],
             "last_watch_age_sec":round(time.time()-runtime["last_position_watch"],1) if runtime["last_position_watch"] else None,
             "error":runtime["position_watch_error"]
         },
@@ -2989,7 +2996,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.6"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.6.1"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
