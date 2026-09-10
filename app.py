@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "5.2.0"
+APP_VERSION = "5.3.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -237,6 +237,7 @@ DEFAULTS = {
     "reversal_exit_edge": "15",
     "breakeven_trigger_pct": "6",
     "breakeven_exit_pct": "0.5",
+    "profit_lock_enabled": "true",
     "position_watch_interval_sec": "8",
     "stale_position_price_sec": "45",
     "readiness_min_trades": "100",
@@ -909,13 +910,22 @@ def positions_with_marks():
                 value=max(0.0,gross-fee)
                 ret=((value/max(p.remaining_cost,1e-9))-1)*100
                 mark_execution_bps=est.get("all_in_bps",0)
+            if c:
+                current_net=expected_exit_total_pct(p,c)
+                peak_c=dict(c);peak_c["price"]=p.peak_price
+                peak_net=expected_exit_total_pct(p,peak_c)
+                lock_floor=strategy_profit_lock(p.strategy,peak_net) if b("profit_lock_enabled") else None
+            else:
+                current_net=ret;peak_net=ret;lock_floor=None
             out.append({
                 "id":p.id,"mint":p.mint,"symbol":p.symbol,"name":p.name,
                 "strategy":p.strategy,"side":side,
                 "leverage":leverage,
                 "entry":p.entry_price,"price":price,
-                "return_pct":ret,"remaining_cost":p.remaining_cost,
+                "return_pct":current_net,"remaining_cost":p.remaining_cost,
                 "market_value":value,"locked_pnl":p.locked_pnl,
+                "peak_return_pct":peak_net,"profit_lock_floor_pct":lock_floor,
+                "profit_lock_armed":lock_floor is not None,
                 "mark_execution_bps":mark_execution_bps,
                 "opened_at":p.opened_at.isoformat()
             })
@@ -2082,25 +2092,80 @@ def close_position(p,c,reason):
     if consecutive_losses()>=i("max_consecutive_losses"):
         runtime["pause_until"]=datetime.now(timezone.utc)+timedelta(minutes=i("loss_pause_minutes"))
 
+
+def expected_exit_total_pct(p,c):
+    """Estimated total P&L % if the remaining position were closed now, after simulated exit friction."""
+    side=strategy_side(p.strategy)
+    leverage=strategy_leverage(p.strategy)
+    mid=nz(c.get("price"))
+    if mid<=0:return directional_return_pct(p,mid)
+    execution_notional=max(0,p.remaining_cost*leverage)
+    if b("execution_simulator_enabled") and execution_notional>0:
+        est=execution_cost_estimate(c,p.strategy,execution_notional)
+        fill=simulated_fill_price(mid,side,"MARK_EXIT",est.get("adverse_bps",0))
+        fee=execution_notional*est.get("fee_bps",0)/10000.0
+    else:
+        fill=mid
+        fee=p.remaining_cost*f("execution_cost_pct")/100
+    raw=directional_raw_return(p.entry_price,fill,side)
+    gross=max(0.0,p.remaining_cost*(1+raw*leverage))
+    net=max(0.0,gross-fee)
+    total=p.locked_pnl+(net-p.remaining_cost)
+    return total/max(p.initial_notional,1e-9)*100
+
+def strategy_profit_lock(strategy,peak_net_pct):
+    """Return minimum net P&L floor after a winner has reached a given peak."""
+    p=nz(peak_net_pct)
+    if strategy=="SCALP_LONG":
+        if p>=8:return max(4.0,p-2.5)
+        if p>=5:return 2.5
+        if p>=3:return 1.25
+        if p>=1.5:return 0.35
+    elif strategy=="PUMP_LONG":
+        if p>=30:return max(14.0,p-9.0)
+        if p>=20:return 9.0
+        if p>=12:return 5.0
+        if p>=8:return 3.0
+        if p>=4:return 1.25
+        if p>=2:return 0.50
+    elif strategy in ("PERP_LONG","PERP_SHORT"):
+        if p>=12:return max(6.0,p-4.0)
+        if p>=8:return 4.0
+        if p>=5:return 2.0
+        if p>=3:return 1.0
+        if p>=1.5:return 0.30
+    return None
+
+def strategy_tp_plan(strategy):
+    # Each tuple is: net-profit trigger %, fraction of original position to close.
+    if strategy=="SCALP_LONG":
+        return [(2.0,.25),(3.5,.25),(5.0,.25)]
+    if strategy=="PUMP_LONG":
+        return [(6.0,.15),(12.0,.20),(20.0,.25)]
+    if strategy in ("PERP_LONG","PERP_SHORT"):
+        return [(2.5,.20),(5.0,.25),(8.0,.25)]
+    return [(8.0,.15),(15.0,.20),(25.0,.25)]
+
 def manage_positions():
     cands={x["mint"]:x for x in runtime["candidates"]}
     with SessionLocal() as s:
         pos=s.scalars(select(Position)).all()
         for p in pos:s.expunge(p)
+
     for p in pos:
         c=cands.get(p.mint)
         if not c:
-            # Do not silently pretend the position is healthy. The dedicated
-            # watcher should repopulate it; until then record a warning.
             last_seen=runtime["position_price_seen"].get(p.mint,0)
             if time.time()-last_seen>f("stale_position_price_sec"):
                 record_event("WARN","POSITION_PRICE_STALE",f"{p.symbol} open-position price is stale",
                              {"mint":p.mint,"strategy":p.strategy},dedupe_sec=120)
             continue
+
         runtime["position_price_seen"][p.mint]=time.time()
         with SessionLocal() as s:
             obj=s.get(Position,p.id)
             if not obj:continue
+
             side=strategy_side(obj.strategy)
             obj.last_price=c["price"]
             if side=="SHORT":
@@ -2108,42 +2173,68 @@ def manage_positions():
             else:
                 obj.peak_price=max(obj.peak_price,c["price"])
 
-            ret=directional_return_pct(obj,c["price"])
-            peak=directional_return_pct(obj,obj.peak_price)
-            pull=ret-peak
+            # Gross mark is useful for momentum/trailing geometry.
+            gross_ret=directional_return_pct(obj,c["price"])
+
+            # Net exit return includes the simulated friction of actually closing now.
+            net_ret=expected_exit_total_pct(obj,c)
+
+            peak_c=dict(c)
+            peak_c["price"]=obj.peak_price
+            peak_net_ret=expected_exit_total_pct(obj,peak_c)
+            pull_net=net_ret-peak_net_ret
+
             prevliq=runtime["prev_liq"].get(obj.mint,c.get("liquidity",0))
             opened=obj.opened_at if obj.opened_at.tzinfo else obj.opened_at.replace(tzinfo=timezone.utc)
             held_minutes=max(0,(datetime.now(timezone.utc)-opened).total_seconds()/60)
             max_hold=f("perp_max_hold_minutes") if str(obj.strategy).startswith("PERP_") else f("spot_max_hold_minutes")
             reason=None
 
-            if ret<=-f("stop_loss_pct"):
+            # 1) Hard risk stop uses estimated net liquidation value.
+            if net_ret<=-f("stop_loss_pct"):
                 reason="STOP_LOSS"
-            elif peak>=f("breakeven_trigger_pct") and ret<=f("breakeven_exit_pct"):
-                reason="BREAK_EVEN_PROTECT"
-            elif held_minutes>=max_hold:
+
+            # 2) Strategy-specific Profit Lock: once meaningful profit has existed,
+            # do not allow the remaining position to round-trip back into a loss.
+            elif b("profit_lock_enabled"):
+                floor=strategy_profit_lock(obj.strategy,peak_net_ret)
+                if floor is not None and net_ret<=floor:
+                    reason="PROFIT_LOCK"
+
+            if reason is None and held_minutes>=max_hold:
                 reason="TIME_STOP"
-            elif str(obj.strategy).startswith("PERP_") and c.get("direction") in ("LONG","SHORT") and c.get("direction")!=side and nz(c.get("direction_edge"))>=f("reversal_exit_edge"):
+            elif reason is None and str(obj.strategy).startswith("PERP_") and c.get("direction") in ("LONG","SHORT") and c.get("direction")!=side and nz(c.get("direction_edge"))>=f("reversal_exit_edge"):
                 reason="SIGNAL_REVERSAL"
-            elif not str(obj.strategy).startswith("PERP_") and prevliq>0 and c["liquidity"]<prevliq*.65:
+            elif reason is None and not str(obj.strategy).startswith("PERP_") and prevliq>0 and c["liquidity"]<prevliq*.65:
                 reason="LIQUIDITY_DROP"
-            elif side=="LONG" and c["buy_pressure"]<24 and ret>0:
+            elif reason is None and side=="LONG" and c["buy_pressure"]<24 and net_ret>0:
                 reason="MOMENTUM_EXIT"
-            elif side=="SHORT" and c["buy_pressure"]>76 and ret>0:
+            elif reason is None and side=="SHORT" and c["buy_pressure"]>76 and net_ret>0:
                 reason="SHORT_SQUEEZE_EXIT"
-            else:
-                if ret>=8 and not obj.tp1: partial_sell(obj,c,.15);obj.tp1=True
-                if ret>=15 and not obj.tp2: partial_sell(obj,c,.20);obj.tp2=True
-                if ret>=25 and not obj.tp3: partial_sell(obj,c,.25);obj.tp3=True
+
+            if reason is None:
+                tp1,tp2,tp3=strategy_tp_plan(obj.strategy)
+                if net_ret>=tp1[0] and not obj.tp1:
+                    partial_sell(obj,c,tp1[1]);obj.tp1=True
+                if net_ret>=tp2[0] and not obj.tp2:
+                    partial_sell(obj,c,tp2[1]);obj.tp2=True
+                if net_ret>=tp3[0] and not obj.tp3:
+                    partial_sell(obj,c,tp3[1]);obj.tp3=True
+
+                # Wide trailing still lets large winners run after profit has already been protected.
                 trail=None
-                if peak>=60:trail=-14
-                elif peak>=35:trail=-11
-                elif peak>=20:trail=-8
-                elif peak>=8:trail=-5
-                if trail is not None and pull<=trail:reason="TRAILING_EXIT"
+                if peak_net_ret>=60:trail=-14
+                elif peak_net_ret>=35:trail=-11
+                elif peak_net_ret>=20:trail=-8
+                elif peak_net_ret>=12:trail=-6
+                if trail is not None and pull_net<=trail:
+                    reason="TRAILING_EXIT"
+
             s.commit()
             s.expunge(obj)
-        if reason:close_position(obj,c,reason)
+
+        if reason:
+            close_position(obj,c,reason)
 
 def choose_entry():
     if not b("bot_enabled") or b("killed"):return
@@ -2224,7 +2315,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.2"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.3"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -2365,6 +2456,7 @@ class SettingsIn(BaseModel):
     reversal_exit_edge: Optional[float]=None
     breakeven_trigger_pct: Optional[float]=None
     breakeven_exit_pct: Optional[float]=None
+    profit_lock_enabled: Optional[bool]=None
     position_watch_interval_sec: Optional[int]=None
     stale_position_price_sec: Optional[int]=None
     readiness_min_trades: Optional[int]=None
@@ -2452,6 +2544,7 @@ def dashboard():
             "execution_simulator_enabled":b("execution_simulator_enabled"),
             "security_required_shadow":b("security_required_shadow"),
             "security_hard_block_shadow":b("security_hard_block_shadow"),
+            "profit_lock_enabled":b("profit_lock_enabled"),
             "operating_mode":operating_mode()
         }
     }
@@ -2474,7 +2567,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.2"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.3"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
