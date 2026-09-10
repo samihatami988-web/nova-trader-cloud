@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "6.5.0"
+APP_VERSION = "6.6.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -332,6 +332,42 @@ DEFAULTS = {
     "router_soft_risk_multiplier": "0.50",
     "router_max_soft_entries_per_hour": "2",
 
+    # V6.6 Launch Sniper — first-seconds PAPER engine.
+    "launch_sniper_enabled": "true",
+    "launch_max_active_watch": "24",
+    "launch_watch_ttl_sec": "30",
+    "launch_entry_max_age_sec": "18",
+    "launch_min_age_sec": "0.35",
+    "launch_min_score": "74",
+    "launch_min_events_2s": "3",
+    "launch_min_unique_buyers_2s": "2",
+    "launch_min_buy_pressure_2s": "68",
+    "launch_min_buy_sol_2s": "0.15",
+    "launch_max_top_buyer_share_pct": "65",
+    "launch_max_mcap_multiple": "1.85",
+    "launch_min_mcap_multiple": "0.90",
+    "launch_creator_window_sec": "600",
+    "launch_creator_max_tokens": "3",
+    "launch_duplicate_symbol_max": "2",
+    "launch_confirmation_required": "2",
+    "launch_confirmation_window_sec": "1.6",
+    "launch_confirmation_gap_ms": "150",
+    "launch_max_positions": "1",
+    "launch_max_position_pct": "0.50",
+    "launch_max_entries_per_hour": "4",
+    "launch_raw_stop_pct": "1.00",
+    "launch_max_net_loss_pct": "7.00",
+    "launch_scratch_after_sec": "3.0",
+    "launch_scratch_peak_pct": "1.0",
+    "launch_scratch_loss_pct": "4.5",
+    "launch_max_hold_sec": "22",
+    "launch_flow_reversal_after_sec": "1.0",
+    "launch_flow_reversal_pressure": "44",
+    "launch_protocol_fee_bps": "125",
+    "launch_interface_fee_bps": "50",
+    "launch_slippage_floor_bps": "35",
+    "launch_impact_coefficient_bps": "180",
+
     "daily_profit_target_pct": "10.0",
     "daily_profit_secure_buffer_pct": "0.25",
     "daily_de_risk_start_pct": "7.0",
@@ -457,6 +493,21 @@ runtime = {
     "router_soft_entry_times": [],
     "router_last_entry": None,
     "router_soft_entries": 0,
+
+    "launch_watch": {},
+    "launch_marks": {},
+    "launch_confirmations": {},
+    "launch_evaluating": set(),
+    "launch_creator_history": {},
+    "launch_symbol_history": {},
+    "launch_entries": 0,
+    "launch_entry_times": [],
+    "launch_new_tokens": 0,
+    "launch_trades_seen": 0,
+    "launch_diag": {},
+    "launch_best": None,
+    "launch_last_event": 0,
+    "launch_last_entry": None,
 
     "engine_error_streak": 0,
     "last_decision_log": {},
@@ -1428,7 +1479,7 @@ def monte_carlo():
 
 def research_report():
     rows=load_research_snapshots()
-    strategies=["SNIPER_LONG","PUMP_LONG","SCALP_LONG","PERP_LONG","PERP_SHORT"]
+    strategies=["LAUNCH_SNIPER","SNIPER_LONG","PUMP_LONG","SCALP_LONG","PERP_LONG","PERP_SHORT"]
     replays={}
     walks={}
     for s in strategies:
@@ -1598,7 +1649,50 @@ def execution_reference_depth(c,strategy):
         return max(100000.0,oi*0.01)
     return max(1000.0,nz(c.get("liquidity")))
 
+
+def sol_usd_reference():
+    for c in runtime.get("candidates",[]):
+        if str(c.get("symbol","")).upper()=="SOL" and nz(c.get("price"))>0:
+            return nz(c.get("price"))
+    return 150.0
+
+def launch_execution_cost_estimate(c,notional_usd):
+    """
+    Conservative PAPER estimate for a first-seconds Pump.fun bonding-curve trade.
+    Fee model defaults to 1.25% Pump.fun + 0.50% future PumpPortal Local interface fee.
+    Slippage/impact are additional and intentionally conservative.
+    """
+    notional=max(1.0,nz(notional_usd))
+    lm=c.get("launch_metrics") or {}
+    flow_sol=max(0.01,nz(lm.get("buy_sol_2s"),nz(lm.get("buy_sol_5s"),0.01)))
+    depth_proxy=max(150.0,flow_sol*sol_usd_reference()*6.0)
+
+    fee_bps=f("launch_protocol_fee_bps")+f("launch_interface_fee_bps")
+    ratio=clamp(notional/max(depth_proxy,1),0,1)
+    impact=f("launch_impact_coefficient_bps")*math.sqrt(ratio)
+    confidence=nz(lm.get("sample_confidence"),0)/100
+    low_conf_penalty=(1-clamp(confidence,0,1))*45
+    slippage=f("launch_slippage_floor_bps")+impact*.45+low_conf_penalty
+    latency=max(20.0,min(400.0,f("simulated_latency_ms")*.35))
+    latency_bps=20+max(0,nz(lm.get("acceleration_score"))-70)*.8
+    adverse=slippage+impact+latency_bps
+    return {
+        "fee_bps":round(fee_bps,3),
+        "spread_bps":0.0,
+        "half_spread_bps":0.0,
+        "slippage_bps":round(slippage,3),
+        "impact_bps":round(impact,3),
+        "latency_bps":round(latency_bps,3),
+        "adverse_bps":round(adverse,3),
+        "all_in_bps":round(fee_bps+adverse,3),
+        "latency_ms":round(latency,1),
+        "reference_depth_usd":round(depth_proxy,2),
+        "order_to_depth_pct":round(ratio*100,4),
+    }
+
 def execution_cost_estimate(c,strategy,notional_usd):
+    if strategy=="LAUNCH_SNIPER":
+        return launch_execution_cost_estimate(c,notional_usd)
     notional=max(1.0,nz(notional_usd))
     perp=str(strategy).startswith("PERP_")
     fee_bps=f("perp_fee_bps") if perp else f("spot_fee_bps")
@@ -1842,7 +1936,7 @@ def planned_collateral(c,strategy):
     governor_mult=governor_risk_multiplier(strategy)
     router_mult=f("router_soft_risk_multiplier") if c.get("_router_soft_pass") else 1.0
     risk_budget=m["equity"]*f("risk_pct")/100*rm*pw*strategy_risk_mult*target_mult*governor_mult*router_mult
-    effective_stop=strategy_max_loss_pct(strategy) if strategy=="SNIPER_LONG" else f("stop_loss_pct")
+    effective_stop=max(0.25,strategy_max_loss_pct(strategy))
     collateral=risk_budget/max((effective_stop/100)*leverage,0.001)
     collateral=min(collateral,m["equity"]*f("max_position_pct")/100,f("cash"))
     return max(0.0,collateral)
@@ -1908,11 +2002,11 @@ def strategy_regime_weight(strategy, regime=None):
     regime=regime or market_regime()
     name=regime.get("name","CHOP")
     table={
-        "RISK_ON":{"SNIPER_LONG":0.90,"PUMP_LONG":1.00,"SCALP_LONG":0.95,"PERP_LONG":1.00,"PERP_SHORT":0.50},
-        "RISK_OFF":{"SNIPER_LONG":0.45,"PUMP_LONG":0.45,"SCALP_LONG":0.65,"PERP_LONG":0.50,"PERP_SHORT":1.00},
-        "CHOP":{"SNIPER_LONG":0.70,"PUMP_LONG":0.60,"SCALP_LONG":1.00,"PERP_LONG":0.72,"PERP_SHORT":0.72},
-        "HIGH_VOL":{"SNIPER_LONG":0.35,"PUMP_LONG":0.35,"SCALP_LONG":0.50,"PERP_LONG":0.55,"PERP_SHORT":0.55},
-        "WARMUP":{"SNIPER_LONG":0.65,"PUMP_LONG":0.70,"SCALP_LONG":0.70,"PERP_LONG":0.70,"PERP_SHORT":0.70},
+        "RISK_ON":{"LAUNCH_SNIPER":0.55,"SNIPER_LONG":0.90,"PUMP_LONG":1.00,"SCALP_LONG":0.95,"PERP_LONG":1.00,"PERP_SHORT":0.50},
+        "RISK_OFF":{"LAUNCH_SNIPER":0.20,"SNIPER_LONG":0.45,"PUMP_LONG":0.45,"SCALP_LONG":0.65,"PERP_LONG":0.50,"PERP_SHORT":1.00},
+        "CHOP":{"LAUNCH_SNIPER":0.35,"SNIPER_LONG":0.70,"PUMP_LONG":0.60,"SCALP_LONG":1.00,"PERP_LONG":0.72,"PERP_SHORT":0.72},
+        "HIGH_VOL":{"LAUNCH_SNIPER":0.15,"SNIPER_LONG":0.35,"PUMP_LONG":0.35,"SCALP_LONG":0.50,"PERP_LONG":0.55,"PERP_SHORT":0.55},
+        "WARMUP":{"LAUNCH_SNIPER":0.30,"SNIPER_LONG":0.65,"PUMP_LONG":0.70,"SCALP_LONG":0.70,"PERP_LONG":0.70,"PERP_SHORT":0.70},
     }
     return table.get(name,table["CHOP"]).get(strategy,0.60)
 
@@ -2063,6 +2157,7 @@ def portfolio_status():
     }
 
 def strategy_entry_score(strategy,c):
+    if strategy=="LAUNCH_SNIPER":return nz(c.get("launch_score"))
     if strategy=="SNIPER_LONG":return nz(c.get("sniper_score"))
     if strategy=="PUMP_LONG":return nz(c.get("pump_score"))
     if strategy=="SCALP_LONG":return nz(c.get("scalp_score"))
@@ -2559,6 +2654,10 @@ def close_position(p,c,reason):
     runtime["cooldowns"][p.mint]=time.time()+i("cooldown_minutes")*60
     runtime["realtime_exit_refs"].pop(p.mint,None)
     runtime["realtime_exit_last_eval"].pop(p.mint,None)
+    runtime["launch_marks"].pop(p.mint,None)
+    if p.strategy=="LAUNCH_SNIPER" and p.mint in runtime["launch_watch"]:
+        runtime["launch_watch"][p.mint]["status"]="CLOSED"
+        runtime["launch_watch"][p.mint]["last_reason"]=reason
     runtime["realtime_exit_last_eval"].pop(p.mint+":rest",None)
     record_event("INFO","POSITION_CLOSED",f"{p.symbol} {p.strategy} closed: {reason}",
                  {"pnl":round(total,4),"pnl_pct":round(pnl_pct,3),"funding_pnl":round(funding_pnl,4)})
@@ -2622,6 +2721,8 @@ def strategy_max_loss_pct(strategy):
     hard=f("stop_loss_pct")
     if not b("capital_shield_enabled"):
         return hard
+    if strategy=="LAUNCH_SNIPER":
+        return f("launch_max_net_loss_pct")
     if strategy=="SNIPER_LONG":
         return min(hard,f("sniper_max_loss_pct"),f("recovery_sniper_loss_cap_pct"))
     if strategy=="SCALP_LONG":
@@ -2633,6 +2734,7 @@ def strategy_max_loss_pct(strategy):
     return hard
 
 def strategy_breakeven_rule(strategy):
+    if strategy=="LAUNCH_SNIPER":return 4.00,0.35
     if strategy=="SNIPER_LONG":return 0.50,0.02
     if strategy=="SCALP_LONG":return 0.75,0.02
     if strategy=="PUMP_LONG":return 1.00,0.05
@@ -2678,7 +2780,13 @@ def expected_exit_total_pct(p,c):
 
 def strategy_profit_lock(strategy,peak_net_pct):
     p=nz(peak_net_pct)
-    if strategy=="SNIPER_LONG":
+    if strategy=="LAUNCH_SNIPER":
+        if p>=25:return max(15.0,p-7.0)
+        if p>=15:return 8.0
+        if p>=10:return 5.0
+        if p>=7:return 3.0
+        if p>=5:return 1.25
+    elif strategy=="SNIPER_LONG":
         if p>=3:return max(2.0,p-0.8)
         if p>=2:return 1.15
         if p>=1.25:return 0.45
@@ -2702,6 +2810,8 @@ def strategy_profit_lock(strategy,peak_net_pct):
     return None
 
 def strategy_tp_plan(strategy):
+    if strategy=="LAUNCH_SNIPER":
+        return [(5.0,.35),(10.0,.30),(18.0,.20)]
     if strategy=="SNIPER_LONG":
         return [(0.80,.40),(1.50,.35),(2.50,.25)]
     if strategy=="SCALP_LONG":
@@ -2714,6 +2824,7 @@ def strategy_tp_plan(strategy):
 
 def manage_positions():
     cands={x["mint"]:x for x in runtime["candidates"]}
+    cands.update(runtime.get("launch_marks",{}))
     with SessionLocal() as s:
         pos=s.scalars(select(Position)).all()
         for p in pos:s.expunge(p)
@@ -2767,8 +2878,11 @@ def manage_positions():
 
             prevliq=runtime["prev_liq"].get(obj.mint,c.get("liquidity",0))
             opened=obj.opened_at if obj.opened_at.tzinfo else obj.opened_at.replace(tzinfo=timezone.utc)
-            held_minutes=max(0,(datetime.now(timezone.utc)-opened).total_seconds()/60)
-            if obj.strategy=="SNIPER_LONG":
+            held_seconds=max(0,(datetime.now(timezone.utc)-opened).total_seconds())
+            held_minutes=held_seconds/60
+            if obj.strategy=="LAUNCH_SNIPER":
+                max_hold=f("launch_max_hold_sec")/60
+            elif obj.strategy=="SNIPER_LONG":
                 max_hold=f("sniper_max_hold_minutes")
             else:
                 max_hold=f("perp_max_hold_minutes") if str(obj.strategy).startswith("PERP_") else f("spot_max_hold_minutes")
@@ -2780,6 +2894,20 @@ def manage_positions():
                 reason="SURVIVAL_GUARD"
             elif flatten_all:
                 reason="GLOBAL_EQUITY_GUARD"
+
+            # First-seconds launch controls use raw event-native market-cap movement
+            # plus net-after-friction P&L. Creator sell is an immediate emergency exit.
+            elif obj.strategy=="LAUNCH_SNIPER" and (c.get("launch_metrics") or {}).get("creator_sell"):
+                reason="LAUNCH_CREATOR_SELL"
+            elif obj.strategy=="LAUNCH_SNIPER" and nz(c.get("launch_raw_move_pct"))<=-f("launch_raw_stop_pct"):
+                reason="LAUNCH_RAW_STOP"
+            elif obj.strategy=="LAUNCH_SNIPER" and held_seconds>=f("launch_scratch_after_sec") and \
+                 peak_net_ret<f("launch_scratch_peak_pct") and net_ret<=-f("launch_scratch_loss_pct"):
+                reason="LAUNCH_SCRATCH_EXIT"
+            elif obj.strategy=="LAUNCH_SNIPER" and held_seconds>=f("launch_flow_reversal_after_sec") and \
+                 nz((c.get("launch_metrics") or {}).get("buy_pressure_2s"),50)<f("launch_flow_reversal_pressure") and \
+                 int((c.get("launch_metrics") or {}).get("sells_2s") or 0)>=int((c.get("launch_metrics") or {}).get("buys_2s") or 0):
+                reason="LAUNCH_FLOW_REVERSAL"
 
             # Strategy-specific hard stop is intentionally tighter than the user-visible
             # absolute stop-loss cap.
@@ -2815,10 +2943,10 @@ def manage_positions():
                     reason="PROFIT_LOCK"
 
             if reason is None and held_minutes>=max_hold:
-                reason="TIME_STOP"
+                reason="LAUNCH_TIME_EXIT" if obj.strategy=="LAUNCH_SNIPER" else "TIME_STOP"
             elif reason is None and str(obj.strategy).startswith("PERP_") and c.get("direction") in ("LONG","SHORT") and c.get("direction")!=side and nz(c.get("direction_edge"))>=f("reversal_exit_edge"):
                 reason="SIGNAL_REVERSAL"
-            elif reason is None and not str(obj.strategy).startswith("PERP_"):
+            elif reason is None and not str(obj.strategy).startswith("PERP_") and obj.strategy!="LAUNCH_SNIPER":
                 shield_min_liq=max(f("min_liquidity"),f("capital_shield_min_liquidity")) if b("capital_shield_enabled") else f("min_liquidity")
                 if c.get("liquidity",0)<shield_min_liq*.70:
                     reason="LIQUIDITY_EMERGENCY"
@@ -2862,6 +2990,501 @@ def manage_positions():
                 runtime["daily_target_lock_time"]=datetime.now(timezone.utc).isoformat()
 
 
+
+
+def launch_diag_inc(key,amount=1):
+    runtime["launch_diag"][key]=runtime["launch_diag"].get(key,0)+amount
+
+def launch_entry_count_hour():
+    now=time.time()
+    runtime["launch_entry_times"]=[t for t in runtime["launch_entry_times"] if now-t<3600]
+    return len(runtime["launch_entry_times"])
+
+def launch_prune_histories():
+    now=time.time()
+    window=max(60,f("launch_creator_window_sec"))
+    for creator,arr in list(runtime["launch_creator_history"].items()):
+        arr=[t for t in arr if now-t<=window]
+        if arr:runtime["launch_creator_history"][creator]=arr
+        else:runtime["launch_creator_history"].pop(creator,None)
+    for symbol,arr in list(runtime["launch_symbol_history"].items()):
+        arr=[x for x in arr if now-nz(x.get("t"))<=window]
+        if arr:runtime["launch_symbol_history"][symbol]=arr
+        else:runtime["launch_symbol_history"].pop(symbol,None)
+
+def register_launch_token(data):
+    mint=str(data.get("mint") or data.get("tokenAddress") or "").strip()
+    if len(mint)<30:return None
+    now=time.time()
+    launch_prune_histories()
+
+    creator=str(
+        data.get("traderPublicKey") or data.get("creator") or
+        data.get("txSigner") or data.get("user") or ""
+    )
+    symbol=str(data.get("symbol") or "?").strip()[:40] or "?"
+    name=str(data.get("name") or symbol).strip()[:120] or symbol
+
+    ch=runtime["launch_creator_history"].setdefault(creator,[]) if creator else []
+    creator_count=len(ch)
+    creator_spam=bool(creator and creator_count>=i("launch_creator_max_tokens"))
+    if creator:ch.append(now)
+
+    sh=runtime["launch_symbol_history"].setdefault(symbol.upper(),[])
+    duplicate_count=len({x.get("mint") for x in sh if x.get("mint")})
+    duplicate_symbol=duplicate_count>=i("launch_duplicate_symbol_max")
+    sh.append({"t":now,"mint":mint})
+
+    mcap=None
+    mcap_kind=None
+    if data.get("marketCapSol") is not None:
+        mcap=nz(data.get("marketCapSol"));mcap_kind="SOL"
+    elif data.get("marketCapQuote") is not None:
+        mcap=nz(data.get("marketCapQuote"));mcap_kind=str(data.get("quoteMint") or "QUOTE")
+
+    initial_buy=nz(
+        data.get("initialBuy") or data.get("initialBuySol") or
+        data.get("solAmount") or data.get("amountSol")
+    )
+
+    info={
+        "mint":mint,"symbol":symbol,"name":name,"creator":creator,
+        "created_t":now,"initial_buy_sol":initial_buy,
+        "create_mcap":mcap,"mcap_kind":mcap_kind,
+        "creator_spam":creator_spam,
+        "creator_token_count":creator_count+1 if creator else 0,
+        "duplicate_symbol":duplicate_symbol,
+        "duplicate_symbol_count":duplicate_count+1,
+        "creator_sell":False,
+        "trades":[],
+        "last_event_t":now,
+        "status":"WATCHING",
+        "last_reason":"collecting first trades",
+    }
+    runtime["launch_watch"][mint]=info
+    runtime["launch_new_tokens"]+=1
+    launch_diag_inc("NEW_TOKEN")
+
+    if creator_spam:launch_diag_inc("CREATOR_SPAM")
+    if duplicate_symbol:launch_diag_inc("DUPLICATE_SYMBOL")
+
+    return info
+
+def add_launch_trade(data):
+    mint=str(data.get("mint") or data.get("tokenAddress") or "").strip()
+    info=runtime["launch_watch"].get(mint)
+    if not info:return None
+
+    tx=str(data.get("txType") or data.get("action") or data.get("type") or "").lower()
+    if tx in ("create","migration","migrate"):
+        return None
+
+    now=time.time()
+    buy=tx=="buy" or str(data.get("isBuy","")).lower()=="true"
+    sell=tx=="sell" or str(data.get("isSell","")).lower()=="true"
+    if not buy and not sell:
+        return None
+
+    trader=str(
+        data.get("traderPublicKey") or data.get("txSigner") or
+        data.get("trader") or data.get("user") or ""
+    )
+    sol_amt=abs(nz(data.get("solAmount") or data.get("sol_amount") or data.get("amountSol")))
+
+    mcap=None;mcap_kind=None
+    if data.get("marketCapSol") is not None:
+        mcap=nz(data.get("marketCapSol"));mcap_kind="SOL"
+    elif data.get("marketCapQuote") is not None:
+        mcap=nz(data.get("marketCapQuote"));mcap_kind=str(data.get("quoteMint") or "QUOTE")
+
+    event={
+        "t":now,"buy":buy,"sell":sell,"trader":trader,"sol":sol_amt,
+        "mcap":mcap,"mcap_kind":mcap_kind,
+    }
+    info["trades"].append(event)
+    info["trades"]=[e for e in info["trades"] if now-e["t"]<=30]
+    info["last_event_t"]=now
+
+    if sell and info.get("creator") and trader==info.get("creator"):
+        info["creator_sell"]=True
+        launch_diag_inc("CREATOR_SELL")
+
+    runtime["launch_trades_seen"]+=1
+    runtime["launch_last_event"]=now
+    return launch_metrics(mint)
+
+def launch_metrics(mint):
+    info=runtime["launch_watch"].get(mint)
+    if not info:return None
+    now=time.time()
+    trades=[e for e in info.get("trades",[]) if now-e["t"]<=10]
+    info["trades"]=trades
+
+    def win(sec):
+        return [e for e in trades if now-e["t"]<=sec]
+    e1,e2,e5=win(1),win(2),win(5)
+    b2=[e for e in e2 if e["buy"]]
+    s2=[e for e in e2 if e["sell"]]
+    b5=[e for e in e5 if e["buy"]]
+
+    independent_buyers={
+        e.get("trader") for e in b2
+        if e.get("trader") and e.get("trader")!=info.get("creator")
+    }
+    independent_buyers5={
+        e.get("trader") for e in b5
+        if e.get("trader") and e.get("trader")!=info.get("creator")
+    }
+
+    # Beta prior prevents 1/1 from looking like a reliable 100% buy-pressure event.
+    pressure=100*(len(b2)+2)/max(len(e2)+4,1)
+    raw_pressure=100*len(b2)/max(len(e2),1)
+    buy_sol=sum(e.get("sol",0) for e in b2)
+    sell_sol=sum(e.get("sol",0) for e in s2)
+    net_sol=buy_sol-sell_sol
+
+    by_buyer={}
+    for e in b2:
+        t=e.get("trader") or "UNKNOWN"
+        by_buyer[t]=by_buyer.get(t,0)+e.get("sol",0)
+    top_share=100*max(by_buyer.values())/max(sum(by_buyer.values()),1e-9) if by_buyer else 100
+
+    older=[e for e in e5 if now-e["t"]>1]
+    rate_now=len(e1)
+    old_rate=len(older)/4.0
+    accel=clamp((rate_now/max(old_rate,.25))*20,0,100)
+
+    current_mcap=None;current_kind=None
+    for e in reversed(trades):
+        if nz(e.get("mcap"))>0:
+            current_mcap=nz(e.get("mcap"));current_kind=e.get("mcap_kind");break
+    create_mcap=nz(info.get("create_mcap"))
+    mcap_multiple=current_mcap/create_mcap if current_mcap and create_mcap and current_kind==info.get("mcap_kind") else None
+
+    event_score=clamp(len(e2)/6*100,0,100)
+    buyer_score=clamp(len(independent_buyers)/4*100,0,100)
+    flow_score=clamp(32*math.log10(1+max(0,buy_sol)*10),0,100)
+    momentum_score=50
+    if mcap_multiple is not None:
+        momentum_score=clamp(45+(mcap_multiple-1)*90,0,100)
+
+    sample_conf=clamp((len(e2)/5)*.55+(len(independent_buyers)/3)*.45,0,1)
+    raw_score=(
+        pressure*.20 + event_score*.20 + buyer_score*.20 +
+        flow_score*.15 + accel*.15 + momentum_score*.10
+    )
+
+    penalty=0
+    if info.get("creator_spam"):penalty+=28
+    if info.get("duplicate_symbol"):penalty+=22
+    if top_share>f("launch_max_top_buyer_share_pct"):
+        penalty+=min(30,(top_share-f("launch_max_top_buyer_share_pct"))*.8)
+    if info.get("creator_sell"):penalty+=70
+
+    score=clamp(raw_score*(.78+.22*sample_conf)-penalty,0,100)
+    age=now-info["created_t"]
+
+    m={
+        "mint":mint,"symbol":info.get("symbol"),"name":info.get("name"),
+        "creator":info.get("creator"),"age_sec":round(age,2),
+        "score":round(score,1),"raw_score":round(raw_score,1),
+        "sample_confidence":round(sample_conf*100,1),
+        "events_1s":len(e1),"events_2s":len(e2),"events_5s":len(e5),
+        "buys_2s":len(b2),"sells_2s":len(s2),
+        "unique_buyers_2s":len(independent_buyers),
+        "unique_buyers_5s":len(independent_buyers5),
+        "buy_pressure_2s":round(pressure,1),
+        "raw_buy_pressure_2s":round(raw_pressure,1),
+        "buy_sol_2s":round(buy_sol,4),"sell_sol_2s":round(sell_sol,4),
+        "net_sol_2s":round(net_sol,4),
+        "top_buyer_share_pct":round(top_share,1),
+        "acceleration_score":round(accel,1),
+        "current_mcap":current_mcap,"mcap_kind":current_kind,
+        "create_mcap":info.get("create_mcap"),
+        "mcap_multiple":round(mcap_multiple,3) if mcap_multiple is not None else None,
+        "creator_spam":bool(info.get("creator_spam")),
+        "duplicate_symbol":bool(info.get("duplicate_symbol")),
+        "creator_sell":bool(info.get("creator_sell")),
+    }
+
+    if runtime["launch_best"] is None or score>nz(runtime["launch_best"].get("score")) or \
+       now-nz(runtime["launch_best"].get("_t"))>8:
+        runtime["launch_best"]={**m,"_t":now}
+    return m
+
+def launch_gate(m):
+    if not b("launch_sniper_enabled"):return False,"launch sniper off"
+    if operating_mode()!="PAPER":return False,"launch sniper paper only"
+    if b("killed") or not b("bot_enabled"):return False,"bot stopped"
+    if runtime["pause_until"] and datetime.now(timezone.utc)<runtime["pause_until"]:
+        return False,"loss pause"
+
+    gok,greason=strategy_governor_gate("LAUNCH_SNIPER")
+    if not gok:return False,greason
+
+    if survival_guard_status()["blocked"]:return False,"survival loss guard"
+    if global_equity_guard_status()["blocked"]:return False,"global equity guard"
+    if b("daily_target_lock_enabled") and daily_target_status()["locked"]:
+        return False,"daily profit target locked"
+    if open_risk_pct()>=f("max_total_open_risk_pct"):
+        return False,"portfolio open risk cap"
+
+    with SessionLocal() as s:
+        if s.scalar(select(Position).where(Position.mint==m["mint"])):
+            return False,"already open"
+        rows=s.scalars(select(Position)).all()
+        if len(rows)>=i("max_positions"):return False,"max positions"
+        launch_open=sum(1 for p in rows if p.strategy=="LAUNCH_SNIPER")
+        if launch_open>=i("launch_max_positions"):return False,"launch max positions"
+
+    if launch_entry_count_hour()>=i("launch_max_entries_per_hour"):
+        return False,"launch hourly limit"
+
+    age=nz(m.get("age_sec"))
+    if age<f("launch_min_age_sec"):return False,"launch too early"
+    if age>f("launch_entry_max_age_sec"):return False,"launch too old"
+    if m.get("creator_sell"):return False,"creator sold"
+    if m.get("creator_spam"):return False,"creator spam"
+    if m.get("duplicate_symbol"):return False,"duplicate ticker spam"
+    if int(m.get("events_2s") or 0)<i("launch_min_events_2s"):return False,"launch low events"
+    if int(m.get("unique_buyers_2s") or 0)<i("launch_min_unique_buyers_2s"):return False,"launch low buyers"
+    if nz(m.get("buy_pressure_2s"))<f("launch_min_buy_pressure_2s"):return False,"launch low buy pressure"
+    if nz(m.get("buy_sol_2s"))<f("launch_min_buy_sol_2s"):return False,"launch low buy flow"
+    if nz(m.get("top_buyer_share_pct"),100)>f("launch_max_top_buyer_share_pct"):
+        return False,"launch buyer concentration"
+    if nz(m.get("score"))<f("launch_min_score"):return False,"launch low score"
+    if not nz(m.get("current_mcap")) or not m.get("mcap_kind"):
+        return False,"launch no price reference"
+
+    mult=m.get("mcap_multiple")
+    if mult is not None:
+        if mult>f("launch_max_mcap_multiple"):return False,"launch late chase"
+        if mult<f("launch_min_mcap_multiple"):return False,"launch already fading"
+
+    return True,"ok"
+
+def launch_confirmation_ready(m):
+    mint=m["mint"];now=time.time()
+    required=max(1,i("launch_confirmation_required"))
+    if required<=1:return True
+    prev=runtime["launch_confirmations"].get(mint)
+
+    if not prev or now-nz(prev.get("first_t"))>f("launch_confirmation_window_sec"):
+        runtime["launch_confirmations"][mint]={
+            "first_t":now,"last_t":now,"count":1,
+            "score":nz(m.get("score")),"buy_pressure":nz(m.get("buy_pressure_2s"))
+        }
+        launch_diag_inc("CONFIRM_WAIT")
+        return False
+
+    if now-nz(prev.get("last_t"))<max(.05,f("launch_confirmation_gap_ms")/1000):
+        return False
+
+    # A second print is only confirmation if the burst has not materially collapsed.
+    if nz(m.get("score"))<nz(prev.get("score"))-7 or \
+       nz(m.get("buy_pressure_2s"))<nz(prev.get("buy_pressure"))-12:
+        runtime["launch_confirmations"][mint]={
+            "first_t":now,"last_t":now,"count":1,
+            "score":nz(m.get("score")),"buy_pressure":nz(m.get("buy_pressure_2s"))
+        }
+        launch_diag_inc("CONFIRM_RESET")
+        return False
+
+    prev["count"]+=1;prev["last_t"]=now
+    prev["score"]=max(prev["score"],nz(m.get("score")))
+    prev["buy_pressure"]=max(prev["buy_pressure"],nz(m.get("buy_pressure_2s")))
+    runtime["launch_confirmations"][mint]=prev
+    if prev["count"]>=required:
+        runtime["launch_confirmations"].pop(mint,None)
+        launch_diag_inc("CONFIRMED")
+        return True
+    return False
+
+def launch_candidate(m,price=1.0):
+    info=runtime["launch_watch"].get(m["mint"],{})
+    # "liquidity" is deliberately not used as a real LP claim; this is a paper launch proxy.
+    depth_proxy=max(150.0,nz(m.get("buy_sol_2s"))*sol_usd_reference()*6)
+    return {
+        "mint":m["mint"],"symbol":m.get("symbol") or "?","name":m.get("name") or "?",
+        "price":max(1e-9,nz(price,1.0)),
+        "liquidity":depth_proxy,
+        "market_risk":nz(m.get("score")),
+        "buy_pressure":nz(m.get("buy_pressure_2s"),50),
+        "m5":0.0,
+        "pump_score":0.0,"scalp_score":0.0,"sniper_score":0.0,
+        "launch_score":nz(m.get("score")),
+        "perp_eligible":False,
+        "data_source":"PUMPPORTAL_LAUNCH",
+        "volatility_regime":"EXTREME",
+        "security":{
+            "status":"LAUNCH_BEHAVIORAL",
+            "score":max(0,min(100,nz(m.get("score")))),
+            "hard_block":bool(m.get("creator_sell") or m.get("creator_spam") or m.get("duplicate_symbol")),
+            "flags":[x for x,v in {
+                "CREATOR_SELL":m.get("creator_sell"),
+                "CREATOR_SPAM":m.get("creator_spam"),
+                "DUPLICATE_TICKER":m.get("duplicate_symbol"),
+            }.items() if v],
+            "source":"FIRST_SECONDS_BEHAVIOR"
+        },
+        "launch_metrics":m,
+        "launch_raw_move_pct":0.0,
+    }
+
+def launch_position_size(m):
+    eq=max(0,nz(metrics().get("equity")))
+    cap=eq*f("launch_max_position_pct")/100
+    gov=governor_risk_multiplier("LAUNCH_SNIPER")
+    # In probation this is intentionally tiny; after positive edge it can scale only to the cap.
+    amount=min(cap*gov,f("cash"))
+    return max(0,amount)
+
+def open_launch_position(m):
+    ok,reason=launch_gate(m)
+    if not ok:return False,reason
+
+    collateral=launch_position_size(m)
+    if collateral<5:return False,"launch position too small"
+
+    c=launch_candidate(m,1.0)
+    est=launch_execution_cost_estimate(c,collateral)
+    mid=1.0
+    fill=simulated_fill_price(mid,"LONG","ENTRY",est.get("adverse_bps",0))
+    fee=collateral*est.get("fee_bps",0)/10000
+    cash_need=collateral+fee
+    if cash_need>f("cash"):return False,"cash"
+
+    setv("cash",f("cash")-cash_need)
+    now_dt=datetime.now(timezone.utc)
+    position_id=None
+    with SessionLocal() as s:
+        pos=Position(
+            mint=m["mint"],symbol=m.get("symbol") or "?",name=m.get("name") or "?",
+            strategy="LAUNCH_SNIPER",
+            entry_price=fill,last_price=mid,peak_price=mid,
+            initial_notional=collateral,remaining_cost=collateral,locked_pnl=-fee,
+            opened_at=now_dt
+        )
+        s.add(pos);s.flush();position_id=pos.id
+        s.add(PositionFeature(
+            position_id=pos.id,strategy="LAUNCH_SNIPER",entry_score=nz(m.get("score")),
+            long_score=0,short_score=0,pump_score=0,scalp_score=0,
+            market_risk=nz(m.get("score")),direction_edge=0,
+            funding_rate=0,open_interest_usd=0,
+            volatility_regime="EXTREME",created_at=now_dt
+        ))
+        s.commit()
+
+    if b("execution_simulator_enabled"):
+        record_execution_event(position_id,None,c,"LAUNCH_SNIPER","ENTRY",collateral,mid,fill,est)
+
+    # Store the event-native quote reference for immediate exit marking.
+    runtime["realtime_exit_refs"][m["mint"]]={
+        "position_id":position_id,
+        "mcap_quote":nz(m.get("current_mcap")),
+        "mcap_kind":m.get("mcap_kind"),
+        "armed_at":time.time()
+    }
+    runtime["launch_marks"][m["mint"]]=c
+    runtime["launch_entries"]+=1
+    runtime["launch_entry_times"].append(time.time())
+    runtime["launch_last_entry"]={
+        "time":now_dt.isoformat(),"symbol":m.get("symbol"),"mint":m["mint"],
+        "score":m.get("score"),"position_usd":round(collateral,2)
+    }
+    runtime["launch_watch"][m["mint"]]["status"]="IN_POSITION"
+    runtime["launch_watch"][m["mint"]]["last_reason"]="launch entry opened"
+    launch_diag_inc("ENTRY")
+    record_event(
+        "INFO","LAUNCH_SNIPER_ENTRY",
+        f"{m.get('symbol')} first-seconds PAPER entry",
+        {"score":m.get("score"),"age_sec":m.get("age_sec"),
+         "events_2s":m.get("events_2s"),"buyers":m.get("unique_buyers_2s"),
+         "pressure":m.get("buy_pressure_2s"),"position_usd":round(collateral,2)}
+    )
+    log_decision(c,"LAUNCH_SNIPER","OPENED","FIRST_SECONDS_ENTRY",
+                 nz(m.get("score")),nz(m.get("score")),100,nz(m.get("score")))
+    return True,"opened"
+
+async def evaluate_launch_mint(mint,m):
+    if not m or mint in runtime["launch_evaluating"]:return
+    runtime["launch_evaluating"].add(mint)
+    try:
+        ok,reason=launch_gate(m)
+        info=runtime["launch_watch"].get(mint)
+        if info:
+            info["last_reason"]=reason
+            info["status"]="READY" if ok else "WATCHING"
+
+        if not ok:
+            launch_diag_inc(reason.upper().replace(" ","_"))
+            return
+        launch_diag_inc("GATE_PASS")
+
+        if not launch_confirmation_ready(m):
+            if info:info["status"]="CONFIRMING"
+            return
+
+        async with entry_lock:
+            # Recompute from latest events immediately before entry.
+            latest=launch_metrics(mint)
+            if not latest:return
+            ok2,reason2=launch_gate(latest)
+            if not ok2:
+                if info:
+                    info["status"]="WATCHING";info["last_reason"]=reason2
+                launch_diag_inc(reason2.upper().replace(" ","_"))
+                return
+            opened,oreason=open_launch_position(latest)
+            if not opened:
+                if info:
+                    info["status"]="BLOCKED";info["last_reason"]=oreason
+                launch_diag_inc(oreason.upper().replace(" ","_"))
+    finally:
+        runtime["launch_evaluating"].discard(mint)
+
+def launch_status():
+    now=time.time()
+    rows=[]
+    for mint,info in list(runtime["launch_watch"].items()):
+        age=now-nz(info.get("created_t"))
+        if age>180 and not open_position_for_mint(mint):
+            runtime["launch_watch"].pop(mint,None)
+            runtime["launch_marks"].pop(mint,None)
+            continue
+        m=launch_metrics(mint)
+        if m:
+            rows.append({
+                **m,
+                "status":info.get("status"),
+                "reason":info.get("last_reason"),
+            })
+    rows.sort(key=lambda x:(nz(x.get("score")), -nz(x.get("age_sec"))),reverse=True)
+    best=rows[0] if rows else runtime.get("launch_best")
+    return {
+        "enabled":b("launch_sniper_enabled"),
+        "mode":"FIRST_SECONDS_PAPER",
+        "new_tokens":runtime["launch_new_tokens"],
+        "trades_seen":runtime["launch_trades_seen"],
+        "watching":sum(1 for x in runtime["launch_watch"].values() if x.get("status")!="IN_POSITION"),
+        "entries":runtime["launch_entries"],
+        "entries_last_hour":launch_entry_count_hour(),
+        "max_entries_per_hour":i("launch_max_entries_per_hour"),
+        "last_event_age_sec":round(now-runtime["launch_last_event"],3) if runtime["launch_last_event"] else None,
+        "best":best,
+        "top":rows[:6],
+        "diag":dict(runtime["launch_diag"]),
+        "last_entry":runtime["launch_last_entry"],
+        "rules":{
+            "score":f("launch_min_score"),
+            "events_2s":i("launch_min_events_2s"),
+            "buyers_2s":i("launch_min_unique_buyers_2s"),
+            "buy_pressure_2s":f("launch_min_buy_pressure_2s"),
+            "min_buy_sol_2s":f("launch_min_buy_sol_2s"),
+            "max_top_buyer_share":f("launch_max_top_buyer_share_pct"),
+            "max_age_sec":f("launch_entry_max_age_sec")
+        }
+    }
 
 def pulse_metrics(mint):
     now=time.time()
@@ -3000,6 +3623,23 @@ async def realtime_exit_check(mint,m):
 
     try:
         ref=runtime["realtime_exit_refs"].get(mint)
+
+        # V6.6: first-seconds positions are marked directly from the same PumpPortal trade stream.
+        if p.strategy=="LAUNCH_SNIPER":
+            lm=launch_metrics(mint)
+            if lm and ref:
+                cur_mcap=nz(lm.get("current_mcap"))
+                cur_kind=lm.get("mcap_kind")
+                if cur_mcap>0 and cur_kind==ref.get("mcap_kind") and nz(ref.get("mcap_quote"))>0:
+                    ratio=cur_mcap/nz(ref.get("mcap_quote"))
+                    if 0.05<ratio<20:
+                        lc=launch_candidate(lm,ratio)
+                        lc["launch_raw_move_pct"]=(ratio-1)*100
+                        runtime["launch_marks"][mint]=lc
+                        runtime["realtime_exit_direct_marks"]+=1
+                        await manage_positions_safe()
+                        return
+
         cur_mcap=nz(m.get("last_mcap_quote"))
         cur_kind=m.get("last_mcap_kind")
 
@@ -3026,7 +3666,7 @@ async def realtime_exit_check(mint,m):
         if now-runtime["realtime_exit_last_eval"].get(rest_key,0)>=rest_gap:
             runtime["realtime_exit_last_eval"][rest_key]=now
             runtime["realtime_exit_rest_checks"]+=1
-            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.5"}) as client:
+            async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Realtime-Exit/6.6"}) as client:
                 rows=await fetch_pairs(client,[mint],{})
                 if rows:
                     rows[0]["position_watch"]=True
@@ -3064,6 +3704,15 @@ async def sync_pulse_subscriptions(ws):
             for mint,born in list(runtime["pulse_subscription_birth"].items()):
                 if mint in open_mints:
                     continue
+
+                linfo=runtime["launch_watch"].get(mint)
+                if linfo and now-nz(linfo.get("created_t"))>f("launch_watch_ttl_sec"):
+                    if linfo.get("status") not in ("IN_POSITION","CLOSED"):
+                        linfo["status"]="EXPIRED"
+                        linfo["last_reason"]="first-seconds window expired"
+                    stale.append(mint)
+                    continue
+
                 hot=runtime["pulse_hot"].get(mint,{})
                 hot_recent=now-nz(hot.get("seen_at"))<30
                 if not hot_recent and now-born>ttl:
@@ -3353,7 +4002,7 @@ async def evaluate_pulse_mint(mint,m):
         runtime["pulse_hot"][mint]=hot
 
         timeout=max(2,min(10,f("pulse_eval_timeout_sec")))
-        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.5"}) as client:
+        async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Pulse-Sniper/6.6"}) as client:
             rows=await asyncio.wait_for(fetch_pairs(client,[mint],{}),timeout=timeout)
             if not rows:
                 pulse_diag_record("NO_DEX_PAIR",mint=mint,m=m,dedupe_sec=10)
@@ -3476,19 +4125,44 @@ async def pumpportal_realtime_loop():
 
                     tx=str(data.get("txType") or data.get("action") or data.get("type") or "").lower()
 
-                    # Observe new/migrating tokens only inside a bounded metered universe.
-                    if tx in ("create","migration","migrate") or data.get("name"):
-                        cap=max(20,i("pulse_max_trade_subscriptions"))
+                    is_create=(tx=="create") or bool(data.get("name") and data.get("symbol"))
+
+                    if is_create:
+                        register_launch_token(data)
+
+                        # Fresh launches get priority inside a small rolling first-seconds universe.
+                        active=[
+                            (m0,info) for m0,info in runtime["launch_watch"].items()
+                            if time.time()-nz(info.get("created_t"))<=f("launch_watch_ttl_sec")
+                            and not open_position_for_mint(m0)
+                        ]
+                        if len(active)>i("launch_max_active_watch"):
+                            active.sort(key=lambda x:nz(x[1].get("created_t")))
+                            evict=[x[0] for x in active[:len(active)-i("launch_max_active_watch")]]
+                            if evict:
+                                await ws.send(json.dumps({"method":"unsubscribeTokenTrade","keys":evict}))
+                                for em in evict:
+                                    runtime["pulse_subscribed"].discard(em)
+                                    runtime["pulse_subscription_birth"].pop(em,None)
+                                    if em in runtime["launch_watch"]:
+                                        runtime["launch_watch"][em]["status"]="EXPIRED"
+                                        runtime["launch_watch"][em]["last_reason"]="launch watch capacity"
+
+                        cap=max(30,i("pulse_max_trade_subscriptions"))
                         if mint not in runtime["pulse_subscribed"] and len(runtime["pulse_subscribed"])<cap:
                             await ws.send(json.dumps({"method":"subscribeTokenTrade","keys":[mint]}))
                             runtime["pulse_subscribed"].add(mint)
                             runtime["pulse_subscription_birth"][mint]=time.time()
 
+                    lm=add_launch_trade(data)
+                    if lm:
+                        asyncio.create_task(evaluate_launch_mint(mint,lm))
+
                     m=add_pulse_event(data)
                     if not m:
                         continue
 
-                    # Critical V6.2: a live trade event wakes exit management immediately.
+                    # Open spot/launch positions are managed from each incoming trade event.
                     if open_position_for_mint(mint):
                         asyncio.create_task(realtime_exit_check(mint,m))
 
@@ -3689,7 +4363,7 @@ async def sniper_scan_loop():
     runtime["sniper_scanner_alive"]=True
     record_event("INFO","SNIPER_START","Micro-Pump Sniper scanner started",
                  {"interval_sec":i("sniper_scan_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.5"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Sniper-Scanner/6.6"}) as client:
         while True:
             try:
                 if b("sniper_enabled"):
@@ -3751,7 +4425,7 @@ async def position_watch_loop():
     runtime["position_watcher_alive"]=True
     record_event("INFO","FAST_WATCH_START","Independent fast position watcher started",
                  {"interval_sec":i("position_watch_interval_sec")},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.5"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Fast-Position-Watcher/6.6"}) as client:
         while True:
             try:
                 with SessionLocal() as s:
@@ -3800,7 +4474,7 @@ def today_guard_status():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.5"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.6"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -4042,6 +4716,37 @@ class SettingsIn(BaseModel):
     router_soft_risk_multiplier: Optional[float]=None
     router_max_soft_entries_per_hour: Optional[int]=None
 
+    launch_sniper_enabled: Optional[bool]=None
+    launch_max_active_watch: Optional[int]=None
+    launch_watch_ttl_sec: Optional[float]=None
+    launch_entry_max_age_sec: Optional[float]=None
+    launch_min_age_sec: Optional[float]=None
+    launch_min_score: Optional[float]=None
+    launch_min_events_2s: Optional[int]=None
+    launch_min_unique_buyers_2s: Optional[int]=None
+    launch_min_buy_pressure_2s: Optional[float]=None
+    launch_min_buy_sol_2s: Optional[float]=None
+    launch_max_top_buyer_share_pct: Optional[float]=None
+    launch_max_mcap_multiple: Optional[float]=None
+    launch_min_mcap_multiple: Optional[float]=None
+    launch_creator_window_sec: Optional[float]=None
+    launch_creator_max_tokens: Optional[int]=None
+    launch_duplicate_symbol_max: Optional[int]=None
+    launch_confirmation_required: Optional[int]=None
+    launch_confirmation_window_sec: Optional[float]=None
+    launch_confirmation_gap_ms: Optional[float]=None
+    launch_max_positions: Optional[int]=None
+    launch_max_position_pct: Optional[float]=None
+    launch_max_entries_per_hour: Optional[int]=None
+    launch_raw_stop_pct: Optional[float]=None
+    launch_max_net_loss_pct: Optional[float]=None
+    launch_scratch_after_sec: Optional[float]=None
+    launch_scratch_peak_pct: Optional[float]=None
+    launch_scratch_loss_pct: Optional[float]=None
+    launch_max_hold_sec: Optional[float]=None
+    launch_flow_reversal_after_sec: Optional[float]=None
+    launch_flow_reversal_pressure: Optional[float]=None
+
     daily_profit_target_pct: Optional[float]=None
     daily_profit_secure_buffer_pct: Optional[float]=None
     daily_de_risk_start_pct: Optional[float]=None
@@ -4102,6 +4807,7 @@ def dashboard():
             "target_risk_multiplier":daily_target_risk_multiplier(),
             "no_martingale":b("no_martingale")
         },
+        "launch_sniper":launch_status(),
         "pulse_intelligence":pulse_diag_summary(),
         "entry_router":{
             "enabled":b("selective_entry_router_enabled"),
@@ -4118,7 +4824,7 @@ def dashboard():
         "edge_governor":{
             "enabled":b("edge_governor_enabled"),
             "strategies":{s:strategy_governor_status(s) for s in
-                ["SNIPER_LONG","SCALP_LONG","PUMP_LONG","PERP_LONG","PERP_SHORT"]}
+                ["LAUNCH_SNIPER","SNIPER_LONG","SCALP_LONG","PUMP_LONG","PERP_LONG","PERP_SHORT"]}
         },
         "survival_guard":survival_guard_status(),
         "realtime_exit":{
@@ -4230,6 +4936,16 @@ def dashboard():
                 "router_soft_market_quality_floor","router_soft_liquidity_floor",
                 "router_min_signal_margin","router_min_buy_pressure","router_max_soft_m5_pct",
                 "router_soft_risk_multiplier","router_max_soft_entries_per_hour",
+                "launch_max_active_watch","launch_watch_ttl_sec","launch_entry_max_age_sec",
+                "launch_min_age_sec","launch_min_score","launch_min_events_2s",
+                "launch_min_unique_buyers_2s","launch_min_buy_pressure_2s","launch_min_buy_sol_2s",
+                "launch_max_top_buyer_share_pct","launch_max_mcap_multiple","launch_min_mcap_multiple",
+                "launch_creator_window_sec","launch_creator_max_tokens","launch_duplicate_symbol_max",
+                "launch_confirmation_required","launch_confirmation_window_sec","launch_confirmation_gap_ms",
+                "launch_max_positions","launch_max_position_pct","launch_max_entries_per_hour",
+                "launch_raw_stop_pct","launch_max_net_loss_pct","launch_scratch_after_sec",
+                "launch_scratch_peak_pct","launch_scratch_loss_pct","launch_max_hold_sec",
+                "launch_flow_reversal_after_sec","launch_flow_reversal_pressure",
                 "daily_profit_target_pct","daily_profit_secure_buffer_pct",
                 "daily_de_risk_start_pct","daily_de_risk_multiplier","max_total_open_risk_pct",
                 "min_liquidity","min_market_risk","min_spot_market_quality","execution_cost_pct","cooldown_minutes"
@@ -4248,6 +4964,7 @@ def dashboard():
             "adaptive_pulse_enabled":b("adaptive_pulse_enabled"),
             "edge_governor_enabled":b("edge_governor_enabled"),
             "selective_entry_router_enabled":b("selective_entry_router_enabled"),
+            "launch_sniper_enabled":b("launch_sniper_enabled"),
             "daily_target_lock_enabled":b("daily_target_lock_enabled"),
             "no_martingale":b("no_martingale"),
             "operating_mode":operating_mode()
@@ -4272,7 +4989,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.5"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/6.6"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
@@ -4355,7 +5072,7 @@ def control(action:str, x_nova_key:Optional[str]=Header(None)):
         with SessionLocal() as s:
             s.query(PositionFeature).delete();s.query(TradeFeature).delete();s.query(ExecutionEvent).delete();s.query(Position).delete();s.query(Trade).delete();s.query(EquityPoint).delete();s.commit()
         setv("cash",getv("start_balance"));setv("bot_enabled","false");setv("killed","false")
-        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["sniper_entries"]=0;runtime["sniper_candidates"]=[];runtime["pulse_entries"]=0;runtime["pulse_diag_events"].clear();runtime["pulse_diag_dedupe"].clear();runtime["pulse_recent_best"].clear();runtime["pulse_confirmations"].clear();runtime["governor_pauses"].clear();runtime["governor_last_reason"].clear();runtime["router_soft_entry_times"].clear();runtime["router_last_entry"]=None;runtime["router_soft_entries"]=0;runtime["pulse_adaptive_shifts"]={"score":0.0,"events":0,"pressure":0.0,"buyers":0};runtime["pulse_adaptive_actions"].clear();runtime["pulse_last_perf_trade_id"]=0;runtime["realtime_exit_checks"]=0;runtime["realtime_exit_direct_marks"]=0;runtime["realtime_exit_rest_checks"]=0;runtime["realtime_exit_refs"].clear();runtime["daily_target_locked"]=False;runtime["daily_target_lock_time"]=None;runtime["pause_until"]=None
+        runtime["cooldowns"].clear();runtime["strategy_pauses"].clear();runtime["last_portfolio_block"]=None;runtime["last_execution_block"]=None;runtime["execution_blocks"]=0;runtime["position_price_seen"].clear();runtime["sniper_entries"]=0;runtime["sniper_candidates"]=[];runtime["pulse_entries"]=0;runtime["pulse_diag_events"].clear();runtime["pulse_diag_dedupe"].clear();runtime["pulse_recent_best"].clear();runtime["pulse_confirmations"].clear();runtime["governor_pauses"].clear();runtime["governor_last_reason"].clear();runtime["router_soft_entry_times"].clear();runtime["router_last_entry"]=None;runtime["router_soft_entries"]=0;runtime["launch_watch"].clear();runtime["launch_marks"].clear();runtime["launch_confirmations"].clear();runtime["launch_evaluating"].clear();runtime["launch_creator_history"].clear();runtime["launch_symbol_history"].clear();runtime["launch_entries"]=0;runtime["launch_entry_times"].clear();runtime["launch_new_tokens"]=0;runtime["launch_trades_seen"]=0;runtime["launch_diag"].clear();runtime["launch_best"]=None;runtime["launch_last_event"]=0;runtime["launch_last_entry"]=None;runtime["pulse_adaptive_shifts"]={"score":0.0,"events":0,"pressure":0.0,"buyers":0};runtime["pulse_adaptive_actions"].clear();runtime["pulse_last_perf_trade_id"]=0;runtime["realtime_exit_checks"]=0;runtime["realtime_exit_direct_marks"]=0;runtime["realtime_exit_rest_checks"]=0;runtime["realtime_exit_refs"].clear();runtime["daily_target_locked"]=False;runtime["daily_target_lock_time"]=None;runtime["pause_until"]=None
         record_event("INFO","PAPER_RESET","Paper account reset to start balance",{"start_balance":f("start_balance")},dedupe_sec=5)
     else: raise HTTPException(400,"Unknown action")
     return {"ok":True,"action":action}
@@ -4374,6 +5091,16 @@ def settings(data:SettingsIn, x_nova_key:Optional[str]=Header(None)):
         raise HTTPException(400,"stop_loss_pct must be 0.5..15")
     if "correlation_threshold" in vals and not (0.3<=vals["correlation_threshold"]<=0.99):
         raise HTTPException(400,"correlation_threshold must be 0.30..0.99")
+    if "launch_min_score" in vals and not (65<=vals["launch_min_score"]<=90):
+        raise HTTPException(400,"launch_min_score must be 65..90")
+    if "launch_min_events_2s" in vals and not (2<=vals["launch_min_events_2s"]<=10):
+        raise HTTPException(400,"launch_min_events_2s must be 2..10")
+    if "launch_min_unique_buyers_2s" in vals and not (1<=vals["launch_min_unique_buyers_2s"]<=6):
+        raise HTTPException(400,"launch_min_unique_buyers_2s must be 1..6")
+    if "launch_max_position_pct" in vals and not (0.10<=vals["launch_max_position_pct"]<=1.0):
+        raise HTTPException(400,"launch_max_position_pct must be 0.10..1.0")
+    if "launch_max_entries_per_hour" in vals and not (1<=vals["launch_max_entries_per_hour"]<=10):
+        raise HTTPException(400,"launch_max_entries_per_hour must be 1..10")
     if "router_soft_market_quality_floor" in vals and not (58<=vals["router_soft_market_quality_floor"]<=70):
         raise HTTPException(400,"router_soft_market_quality_floor must be 58..70")
     if "router_soft_liquidity_floor" in vals and not (25000<=vals["router_soft_liquidity_floor"]<=50000):
