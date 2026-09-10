@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, String, Float, Integer, Boolean, DateTime, Text, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.1.0"
 DEX = "https://api.dexscreener.com"
 VELOCITY_DATA = "https://data.velocity.exchange"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -246,6 +246,7 @@ DEFAULTS = {
     "readiness_max_exec_bps": "80",
     "min_liquidity": "20000",
     "min_market_risk": "70",
+    "min_spot_market_quality": "55",
     "execution_cost_pct": "0.50",
     "cooldown_minutes": "10",
     "max_consecutive_losses": "3",
@@ -456,7 +457,7 @@ async def scan_token_security(client,c,force=False):
         return result
     except Exception as e:
         result={
-            "status":"UNKNOWN","score":50.0,"hard_block":False,
+            "status":"UNKNOWN","score":None,"hard_block":False,
             "flags":[f"security scan unavailable: {str(e)[:120]}"],
             "source":"SOLANA_RPC","note":"No contract-security conclusion was made."
         }
@@ -1267,7 +1268,12 @@ def route_quality(c,strategy,notional_usd=None):
         age=iso_age_seconds(runtime.get("last_spot_refresh"))
     freshness=clamp(100-age/max(f("max_data_age_sec"),1)*70,0,100)
     sec=(c.get("security") or {})
-    security_q=nz(sec.get("score"),nz(c.get("market_risk"),50)) if not c.get("perp_eligible") else nz(c.get("market_risk"),70)
+    if c.get("perp_eligible"):
+        security_q=75.0
+    elif sec.get("status")=="UNKNOWN" or sec.get("score") is None:
+        security_q=70.0
+    else:
+        security_q=nz(sec.get("score"),70)
     est=execution_cost_estimate(c,strategy,notional)
     max_cost=max(f("max_execution_cost_bps"),1)
     execution_q=clamp(100-est.get("all_in_bps",0)/max_cost*70,0,100)
@@ -1291,7 +1297,12 @@ def signal_quality(c,strategy,signal_score):
     pw=portfolio_weight(strategy)
     route=route_quality(c,strategy)
     sec=(c.get("security") or {})
-    sq=nz(sec.get("score"),85 if c.get("perp_eligible") else 50)
+    if c.get("perp_eligible"):
+        sq=100.0
+    elif sec.get("status")=="UNKNOWN" or sec.get("score") is None:
+        sq=70.0
+    else:
+        sq=nz(sec.get("score"),70)
     market=nz(c.get("market_risk"),50)
     quality=nz(signal_score)
     quality*=0.58+0.42*clamp(pw,0,1)
@@ -1304,7 +1315,7 @@ def token_security_status():
     spots=[c for c in runtime.get("candidates",[]) if not c.get("perp_eligible")]
     rows=[]
     for c in spots[:20]:
-        sec=c.get("security") or {"status":"UNKNOWN","score":50,"flags":[]}
+        sec=c.get("security") or {"status":"UNKNOWN","score":None,"flags":[]}
         rows.append({
             "mint":c.get("mint"),"symbol":c.get("symbol"),"status":sec.get("status"),
             "score":sec.get("score"),"hard_block":sec.get("hard_block",False),
@@ -1857,20 +1868,30 @@ def adaptive_status():
 def gate(c,strategy=None):
     if b("killed"): return False,"kill switch"
     if not b("bot_enabled"): return False,"bot stopped"
+
     health=source_health()
-    if health["last_loop_age_sec"]>f("max_data_age_sec"): return False,"stale market data"
+    if health["last_loop_age_sec"]>f("max_data_age_sec"):
+        return False,"stale market data"
     if operating_mode()=="SHADOW" and not b("execution_simulator_enabled"):
         return False,"shadow requires execution simulator"
-    if runtime["pause_until"] and datetime.now(timezone.utc)<runtime["pause_until"]: return False,"loss pause"
+    if runtime["pause_until"] and datetime.now(timezone.utc)<runtime["pause_until"]:
+        return False,"loss pause"
+
     if strategy:
         spu=runtime["strategy_pauses"].get(strategy)
-        if spu and datetime.now(timezone.utc)<spu:return False,"strategy adaptive pause"
+        if spu and datetime.now(timezone.utc)<spu:
+            return False,"strategy adaptive pause"
 
+    # V5.1 HOTFIX:
+    # SPOT and PERP no longer share one market-quality gate.
     if c.get("perp_eligible"):
-        if c.get("data_source")=="VELOCITY" and c.get("open_interest_usd",0) < f("min_perp_oi_usd"):
-            return False,"low perp open interest"
-        if c.get("data_source")=="VELOCITY" and c.get("direction_edge",0) < f("min_direction_edge"):
-            return False,"weak directional edge"
+        # PERP gate = OI + direction edge + funding + volatility + primary source in SHADOW.
+        # The generic spot market-quality score is intentionally NOT a hard gate here.
+        if c.get("data_source")=="VELOCITY":
+            if c.get("open_interest_usd",0) < f("min_perp_oi_usd"):
+                return False,"low perp open interest"
+            if c.get("direction_edge",0) < f("min_direction_edge"):
+                return False,"weak directional edge"
         if abs(c.get("funding_rate",0)) > f("max_abs_funding_rate"):
             return False,"extreme funding"
         if b("block_extreme_volatility") and c.get("volatility_regime")=="EXTREME":
@@ -1878,37 +1899,53 @@ def gate(c,strategy=None):
         if operating_mode()=="SHADOW" and c.get("data_source")!="VELOCITY":
             return False,"shadow requires primary perp source"
     else:
-        if c["liquidity"] < f("min_liquidity"): return False,"low liquidity"
+        # SPOT gate = liquidity + spot market quality + on-chain security.
+        if c.get("liquidity",0) < f("min_liquidity"):
+            return False,"low spot liquidity"
+        if c.get("market_risk",0) < f("min_spot_market_quality"):
+            return False,"low spot market quality"
+
         sec=c.get("security") or {}
         sec_status=sec.get("status","UNKNOWN")
-        sec_score=nz(sec.get("score"),50)
-        if sec_status!="UNKNOWN" and sec_score<f("min_token_security_score"):
+        sec_score=sec.get("score")
+        if sec_status!="UNKNOWN" and sec_score is not None and nz(sec_score)<f("min_token_security_score"):
             return False,"token security score too low"
         if operating_mode()=="SHADOW" and b("security_required_shadow") and sec_status=="UNKNOWN":
             return False,"shadow requires token security scan"
         if operating_mode()=="SHADOW" and b("security_hard_block_shadow") and sec.get("hard_block"):
             return False,"shadow token security hard block"
 
-    if c["market_risk"] < f("min_market_risk"): return False,"market risk gate"
     if strategy and strategy_side(strategy)=="SHORT" and not c.get("perp_eligible"):
         return False,"short unavailable for spot-only token"
+
     with SessionLocal() as s:
-        if s.scalar(select(Position).where(Position.mint==c["mint"])): return False,"already open"
-        if len(s.scalars(select(Position)).all()) >= i("max_positions"): return False,"max positions"
+        if s.scalar(select(Position).where(Position.mint==c["mint"])):
+            return False,"already open"
+        if len(s.scalars(select(Position)).all()) >= i("max_positions"):
+            return False,"max positions"
+
     cd=runtime["cooldowns"].get(c["mint"])
-    if cd and time.time()<cd:return False,"cooldown"
-    start=f("start_balance")
-    if today_realized() <= -(start*f("daily_loss_limit_pct")/100): return False,"daily loss limit"
+    if cd and time.time()<cd:
+        return False,"cooldown"
+
+    start_balance=f("start_balance")
+    if today_realized() <= -(start_balance*f("daily_loss_limit_pct")/100):
+        return False,"daily loss limit"
+
     if strategy:
         rok,rreason,rdetail=route_gate(c,strategy)
-        if not rok:return False,rreason
+        if not rok:
+            return False,rreason
+
         pok,preason,pdetail=portfolio_gate(c,strategy)
         if not pok:
             runtime["last_portfolio_block"]={
                 "time":datetime.now(timezone.utc).isoformat(),
-                "symbol":c.get("symbol"),"strategy":strategy,"reason":preason,"detail":pdetail
+                "symbol":c.get("symbol"),"strategy":strategy,
+                "reason":preason,"detail":pdetail
             }
             return False,preason
+
     return True,"ok"
 
 def open_position(c,strategy):
@@ -2143,7 +2180,7 @@ def choose_entry():
 async def engine_loop():
     runtime["loop_alive"]=True
     record_event("INFO","ENGINE_START","NOVA engine loop started",{"version":APP_VERSION},dedupe_sec=5)
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.0"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.1"}) as client:
         addresses=[];boosts={};last_discovery=0
         while True:
             try:
@@ -2177,7 +2214,7 @@ async def engine_loop():
                     for c in spot_ranked[scan_n:]:
                         cached=runtime["token_security"].get(c["mint"])
                         c["security"]={k:v for k,v in cached.items() if k!="_ts"} if cached else {
-                            "status":"UNKNOWN","score":50.0,"hard_block":False,
+                            "status":"UNKNOWN","score":None,"hard_block":False,
                             "flags":["not scanned in current top-N window"],"source":"SOLANA_RPC"
                         }
                     for c in pairs:
@@ -2283,6 +2320,7 @@ class SettingsIn(BaseModel):
     readiness_max_exec_bps: Optional[float]=None
     min_liquidity: Optional[float]=None
     min_market_risk: Optional[float]=None
+    min_spot_market_quality: Optional[float]=None
     execution_cost_pct: Optional[float]=None
     cooldown_minutes: Optional[int]=None
 
@@ -2350,7 +2388,7 @@ def dashboard():
                 "breakeven_trigger_pct","breakeven_exit_pct","readiness_min_trades","readiness_min_pf",
                 "readiness_min_shadow_hours","readiness_max_drawdown_pct","readiness_max_mc_below_start_pct",
                 "readiness_min_wf_robust","readiness_max_exec_bps",
-                "min_liquidity","min_market_risk","execution_cost_pct","cooldown_minutes"
+                "min_liquidity","min_market_risk","min_spot_market_quality","execution_cost_pct","cooldown_minutes"
             ]},
             "block_extreme_volatility":b("block_extreme_volatility"),
             "adaptive_enabled":b("adaptive_enabled"),
@@ -2380,7 +2418,7 @@ async def security_rescan(mint:str, x_nova_key:Optional[str]=Header(None)):
     auth(x_nova_key)
     c=next((x for x in runtime["candidates"] if x.get("mint")==mint),None)
     if not c:raise HTTPException(404,"Candidate not found")
-    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.0"}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"NOVA-Trader-Ultimate/5.1"}) as client:
         result=await scan_token_security(client,c,force=True)
     c["security"]=result
     return {"mint":mint,"symbol":c.get("symbol"),"security":result}
